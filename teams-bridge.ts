@@ -16,7 +16,7 @@ import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 const {
   TEAMS_APP_ID,
   TEAMS_APP_PASSWORD,
-  LOVABLE_INTERNAL_SECRET,
+  INTERNAL_LOOKUP_SECRET,
   TEAMS_TENANT_LOOKUP_URL,
   RAG_QUERY_URL,
   SUPABASE_ANON_KEY,
@@ -25,7 +25,7 @@ const {
 if (
   !TEAMS_APP_ID ||
   !TEAMS_APP_PASSWORD ||
-  !LOVABLE_INTERNAL_SECRET ||
+  !INTERNAL_LOOKUP_SECRET ||
   !TEAMS_TENANT_LOOKUP_URL ||
   !RAG_QUERY_URL ||
   !SUPABASE_ANON_KEY
@@ -90,7 +90,7 @@ async function resolveInnsynTenantId(
     headers: {
       "Content-Type": "application/json",
       apikey: SUPABASE_ANON_KEY,
-      "x-internal-token": LOVABLE_INTERNAL_SECRET,
+      "x-internal-token": INTERNAL_LOOKUP_SECRET,
     },
     body: JSON.stringify({ teams_tenant_id: aadTenantId }),
   });
