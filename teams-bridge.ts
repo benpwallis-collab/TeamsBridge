@@ -231,10 +231,11 @@ async function sendTeamsReply(activity: TeamsActivity, text: string) {
 
   const token = await getBotFrameworkToken();
 
-  const url =
-    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
-      activity.conversation.id,
-    )}/activities`;
+  const serviceUrl = activity.serviceUrl.replace(/\/+$/, ""); // remove trailing slash(es)
+
+const url = `${serviceUrl}/v3/conversations/${encodeURIComponent(
+  activity.conversation.id
+)}/activities`;
 
   console.log("🔍 REPLY POST →", url);
 
