@@ -1,10 +1,13 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge (Shared, Multi-tenant, Slack-aligned security model)
  *
- * - Verifies BotFramework JWT
- * - Resolves AAD Tenant -> InnsynAI tenant via Lovable internal resolver
+ * - Multi-tenant BotFramework JWT validation (audience = customer's Bot App ID)
+ * - Resolves Bot App ID → Innsyn tenant (new)
+ * - Resolves AAD tenant → Innsyn tenant (existing)
  * - Calls RAG via anon key + x-tenant-id
- * - Replies to Teams via BotFramework API
+ * - Replies to Teams using per-tenant bot credentials
+ *
+ * No service-role keys. All lookups go through Lovable’s internal resolver.
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -14,26 +17,17 @@ import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
  * ENV VARS
  ********************************************************************************************/
 const {
-  TEAMS_APP_ID,
-  TEAMS_APP_PASSWORD,
   INTERNAL_LOOKUP_SECRET,
-  TEAMS_TENANT_LOOKUP_URL,
+  TEAMS_TENANT_LOOKUP_URL, // Used for BOTH AAD tenant and bot_app_id lookup
   RAG_QUERY_URL,
   SUPABASE_ANON_KEY,
 } = Deno.env.toObject();
 
 console.log("🔧 TEAMS BRIDGE STARTUP");
-console.log("  TEAMS_APP_ID:", TEAMS_APP_ID);
-console.log(
-  "  TEAMS_APP_PASSWORD length:",
-  TEAMS_APP_PASSWORD ? TEAMS_APP_PASSWORD.length : 0,
-);
 console.log("  TEAMS_TENANT_LOOKUP_URL:", TEAMS_TENANT_LOOKUP_URL);
 console.log("  RAG_QUERY_URL:", RAG_QUERY_URL);
 
 if (
-  !TEAMS_APP_ID ||
-  !TEAMS_APP_PASSWORD ||
   !INTERNAL_LOOKUP_SECRET ||
   !TEAMS_TENANT_LOOKUP_URL ||
   !RAG_QUERY_URL ||
@@ -46,6 +40,7 @@ if (
 /********************************************************************************************
  * BOTFRAMEWORK OPENID CONFIG
  ********************************************************************************************/
+
 const OPENID_CONFIG_URL =
   "https://login.botframework.com/v1/.well-known/openidconfiguration";
 
@@ -61,46 +56,36 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
   return jwks!;
 }
 
-async function verifyBotFrameworkJwt(authHeader: string | null) {
-  if (!authHeader?.startsWith("Bearer ")) {
-    throw new Error("Missing or invalid Authorization header");
-  }
+/********************************************************************************************
+ * RESOLVERS (Lovable-managed microservice)
+ ********************************************************************************************/
 
-  const token = authHeader.slice("Bearer ".length);
-  const keyStore = jose.createLocalJWKSet(await getJwks());
+// NEW → Resolve using Bot App ID
+async function resolveByBotAppId(botAppId: string) {
+  console.log("🔍 Resolving Innsyn tenant for bot_app_id:", botAppId);
 
-  console.log("🔍 Verifying incoming BF JWT with audience:", TEAMS_APP_ID);
-
-  const result = await jose.jwtVerify(token, keyStore, {
-    issuer: "https://api.botframework.com",
-    audience: TEAMS_APP_ID,
+  const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      "x-internal-token": INTERNAL_LOOKUP_SECRET,
+    },
+    body: JSON.stringify({ bot_app_id: botAppId }),
   });
 
-  console.log("✅ Incoming JWT verified");
-  return result;
+  if (!res.ok) {
+    console.error("❌ BotAppId resolver failed:", await res.text());
+    return null;
+  }
+
+  const json = await res.json();
+  console.log("✅ BotAppId resolver result:", json);
+  return json; // { tenant_id, bot_app_id, bot_app_password }
 }
 
-/********************************************************************************************
- * TYPES
- ********************************************************************************************/
-interface TeamsActivity {
-  type: string;
-  id?: string;
-  serviceUrl?: string;
-  text?: string;
-  replyToId?: string;
-  conversation?: { id: string };
-  channelData?: {
-    tenant?: { id?: string }; // AAD tenant ID
-  };
-}
-
-/********************************************************************************************
- * INTERNAL TENANT LOOKUP (Slack-aligned)
- ********************************************************************************************/
-async function resolveInnsynTenantId(
-  aadTenantId: string,
-): Promise<string | null> {
+// Existing → Resolve using AAD tenant ID
+async function resolveInnsynTenantId(aadTenantId: string): Promise<string | null> {
   console.log("🔍 Resolving InnsynAI tenant for AAD tenant:", aadTenantId);
 
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
@@ -124,7 +109,61 @@ async function resolveInnsynTenantId(
 }
 
 /********************************************************************************************
- * RAG QUERY (Slack-aligned security model)
+ * MULTI-TENANT JWT VALIDATION
+ *
+ * Steps:
+ * 1. Decode BF JWT WITHOUT verifying → extract “aud” (customer bot App ID)
+ * 2. Lookup bot_app_id → tenant & bot secret
+ * 3. Verify JWT using that bot’s App ID
+ ********************************************************************************************/
+
+async function verifyBotFrameworkJwt(authHeader: string | null) {
+  if (!authHeader?.startsWith("Bearer ")) {
+    throw new Error("Missing or invalid Authorization header");
+  }
+
+  const token = authHeader.slice("Bearer ".length);
+  const decoded = jose.decodeJwt(token);
+  const incomingBotAppId = decoded.aud;
+
+  if (typeof incomingBotAppId !== "string") {
+    throw new Error("Invalid or missing aud claim in BF JWT");
+  }
+
+  console.log("🔍 Incoming bot App ID (aud):", incomingBotAppId);
+
+  // 1) Resolve which Innsyn tenant owns this bot
+  const tenantInfo = await resolveByBotAppId(incomingBotAppId);
+  if (!tenantInfo) throw new Error("Unknown bot App ID");
+
+  // 2) Validate JWT against *this tenant’s* bot App ID
+  const keyStore = jose.createLocalJWKSet(await getJwks());
+  await jose.jwtVerify(token, keyStore, {
+    issuer: "https://api.botframework.com",
+    audience: incomingBotAppId,
+  });
+
+  console.log("✅ BF JWT verified for bot:", incomingBotAppId);
+  return tenantInfo; // { tenant_id, bot_app_id, bot_app_password }
+}
+
+/********************************************************************************************
+ * TYPES
+ ********************************************************************************************/
+interface TeamsActivity {
+  type: string;
+  id?: string;
+  serviceUrl?: string;
+  text?: string;
+  replyToId?: string;
+  conversation?: { id: string };
+  channelData?: {
+    tenant?: { id?: string }; // AAD tenant ID
+  };
+}
+
+/********************************************************************************************
+ * RAG QUERY
  ********************************************************************************************/
 async function callRagQuery(tenantId: string, question: string) {
   console.log("🔍 Calling RAG for tenant:", tenantId, "question:", question);
@@ -136,10 +175,7 @@ async function callRagQuery(tenantId: string, question: string) {
       apikey: SUPABASE_ANON_KEY,
       "x-tenant-id": tenantId,
     },
-    body: JSON.stringify({
-      question,
-      source: "teams",
-    }),
+    body: JSON.stringify({ question, source: "teams" }),
   });
 
   if (!res.ok) {
@@ -149,192 +185,106 @@ async function callRagQuery(tenantId: string, question: string) {
   }
 
   const json = await res.json();
-  console.log("✅ RAG response received (keys):", Object.keys(json));
+  console.log("✅ RAG response received");
   return json;
 }
 
 /********************************************************************************************
- * BOTFRAMEWORK REPLY
+ * REPLY TO TEAMS (USING PER-TENANT BOT CREDENTIALS)
  ********************************************************************************************/
-async function getBotFrameworkToken(): Promise<string> {
-  console.log("🔍 BF TOKEN REQUEST");
-  console.log("  TEAMS_APP_ID:", TEAMS_APP_ID);
-  console.log(
-    "  TEAMS_APP_PASSWORD length:",
-    TEAMS_APP_PASSWORD ? TEAMS_APP_PASSWORD.length : 0,
-  );
+async function getBotFrameworkToken(botAppId: string, botAppPassword: string): Promise<string> {
+  console.log("🔍 BF TOKEN REQUEST for bot:", botAppId);
 
   const body = new URLSearchParams({
     grant_type: "client_credentials",
-    client_id: TEAMS_APP_ID,
-    client_secret: TEAMS_APP_PASSWORD,
+    client_id: botAppId,
+    client_secret: botAppPassword,
     scope: "https://api.botframework.com/.default",
   });
 
   const res = await fetch(
     "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-    },
+    { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }
   );
 
   if (!res.ok) {
-    const text = await res.text();
-    console.error("❌ BF TOKEN ERROR");
-    console.error("  Status:", res.status);
-    console.error("  Body:", text);
+    console.error("❌ BF TOKEN ERROR:", await res.text());
     throw new Error("botframework token error");
   }
 
   const json = await res.json();
-  const accessToken: string = json.access_token;
-
   console.log("✅ BF TOKEN ACQUIRED");
-  console.log("  Access token first 40 chars:", accessToken.slice(0, 40));
-
-  // Best-effort decode of token to inspect appid/aud
-  try {
-    const parts = accessToken.split(".");
-    if (parts.length === 3) {
-      const payloadB64 = parts[1]
-        .replace(/-/g, "+")
-        .replace(/_/g, "/")
-        .padEnd(parts[1].length + (4 - (parts[1].length % 4)) % 4, "=");
-      const payloadJson = JSON.parse(atob(payloadB64));
-      console.log("🔍 DECODED ACCESS TOKEN PAYLOAD:", payloadJson);
-    } else {
-      console.error("⚠️ Unexpected access token format, cannot decode payload");
-    }
-  } catch (err) {
-    console.error("⚠️ Failed to decode access token payload:", err);
-  }
-
-  return accessToken;
+  return json.access_token;
 }
 
-async function sendTeamsReply(activity: TeamsActivity, text: string) {
-  if (!activity.serviceUrl || !activity.conversation?.id) {
-    console.error("❌ Missing serviceUrl or conversation.id");
-    console.error("Activity:", JSON.stringify(activity, null, 2));
-    return;
-  }
+async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any) {
+  if (!activity.serviceUrl || !activity.conversation?.id) return;
 
-  console.log("🔍 REPLY PREP");
-  console.log("  serviceUrl:", activity.serviceUrl);
-  console.log("  conversationId:", activity.conversation.id);
-  console.log("  replyToId:", activity.replyToId || activity.id);
-  console.log("  text:", text);
+  console.log("🔍 Sending reply using bot:", creds.bot_app_id);
 
-  const token = await getBotFrameworkToken();
+  const token = await getBotFrameworkToken(creds.bot_app_id, creds.bot_app_password);
+  const serviceUrl = activity.serviceUrl.replace(/\/+$/, "");
+  const url = `${serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities`;
 
-  const serviceUrl = activity.serviceUrl.replace(/\/+$/, ""); // remove trailing slash(es)
-
-const url = `${serviceUrl}/v3/conversations/${encodeURIComponent(
-  activity.conversation.id
-)}/activities`;
-
-  console.log("🔍 REPLY POST →", url);
-
-  const payload = {
-    type: "message",
-    text,
-    replyToId: activity.replyToId ?? activity.id,
-  };
+  const payload = { type: "message", text, replyToId: activity.replyToId ?? activity.id };
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
-    const body = await res.text();
-    console.error("❌ REPLY ERROR");
-    console.error("  Status:", res.status);
-    console.error("  Body:", body);
-    return;
+    console.error("❌ REPLY ERROR", await res.text());
+  } else {
+    console.log("✅ Reply sent");
   }
-
-  console.log("✅ REPLY SENT SUCCESSFULLY");
 }
 
 /********************************************************************************************
  * MAIN HANDLER
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
-  if (req.method === "GET") {
-    return new Response("ok", { status: 200 });
-  }
-  if (req.method !== "POST") {
-    return new Response("method not allowed", { status: 405 });
-  }
+  if (req.method === "GET") return new Response("ok");
+  if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 
-  console.log("🔔 Incoming Teams request:", req.method, req.url);
+  console.log("🔔 Incoming Teams POST");
 
-  // 1) Verify JWT
+  // 1) Multi-tenant JWT validation
+  let creds;
   try {
-    await verifyBotFrameworkJwt(req.headers.get("Authorization"));
+    creds = await verifyBotFrameworkJwt(req.headers.get("Authorization"));
   } catch (err) {
-    console.error("❌ JWT verification failed:", err);
+    console.error("❌ JWT failed:", err);
     return new Response("unauthorized", { status: 401 });
   }
 
+  // 2) Parse activity
   const activity = (await req.json()) as TeamsActivity;
+  if (activity.type !== "message" || !activity.text) return new Response("ignored");
 
-  console.log("🔍 Parsed activity:");
-  console.log("  type:", activity.type);
-  console.log("  id:", activity.id);
-  console.log("  serviceUrl:", activity.serviceUrl);
-  console.log("  conversationId:", activity.conversation?.id);
-  console.log("  text:", activity.text);
-  console.log("  channelData.tenant.id:", activity.channelData?.tenant?.id);
-
-  if (activity.type !== "message" || !activity.text) {
-    console.log("ℹ️ Non-message or empty-text activity, ignoring");
-    return new Response("ignored", { status: 200 });
-  }
-
-  // 2) Extract AAD Tenant ID
   const aadTenantId = activity.channelData?.tenant?.id;
-  if (!aadTenantId) {
-    console.error("❌ No tenant id in activity");
-    return new Response("bad request", { status: 400 });
-  }
+  if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // 3) Resolve InnsynAI tenant (Slack-aligned)
+  // 3) Resolve Innsyn tenant by AAD tenant
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) {
-    console.error("❌ No InnsynAI tenant mapping for AAD tenant:", aadTenantId);
-    await sendTeamsReply(
-      activity,
-      "⚠️ InnsynAI is not configured for this Microsoft 365 tenant. Admin must click 'Add to Teams' in InnsynAI.",
-    );
-    return new Response("no tenant mapping", { status: 200 });
+    await sendTeamsReply(activity, "⚠️ InnsynAI is not configured for this Microsoft 365 tenant.", creds);
+    return new Response("no tenant mapping");
   }
 
   // 4) Call RAG
   let rag;
   try {
     rag = await callRagQuery(tenantId, activity.text.trim());
-  } catch (err) {
-    console.error("❌ RAG call failed:", err);
-    await sendTeamsReply(activity, "❌ Something went wrong.");
-    return new Response("rag error", { status: 200 });
+  } catch {
+    await sendTeamsReply(activity, "❌ Something went wrong.", creds);
+    return new Response("rag error");
   }
 
-  // 5) Reply to Teams
-  const answer = rag?.answer ?? "No answer.";
-  console.log("🔍 RAG answer:", answer);
-  await sendTeamsReply(activity, answer);
-
-  return new Response("ok", { status: 200 });
+  // 5) Reply
+  await sendTeamsReply(activity, rag?.answer ?? "No answer.", creds);
+  return new Response("ok");
 }
 
 /********************************************************************************************
@@ -342,13 +292,7 @@ async function handleTeams(req: Request): Promise<Response> {
  ********************************************************************************************/
 serve((req) => {
   const url = new URL(req.url);
-
-  if (url.pathname === "/health") {
-    return new Response("ok", { status: 200 });
-  }
-  if (url.pathname === "/teams") {
-    return handleTeams(req);
-  }
-
+  if (url.pathname === "/health") return new Response("ok");
+  if (url.pathname === "/teams") return handleTeams(req);
   return new Response("not found", { status: 404 });
 });
