@@ -1,13 +1,13 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge – Fully Patched Version
- * 
+ *
  * Includes:
  *  - Full activity logging
  *  - Valid BotFramework JWT validation
  *  - Tenant resolution by bot_app_id + AAD tenant
  *  - RAG query forwarding
- *  - Correct Teams reply handling
- *  - FIX: serviceUrl normalization (removes invalid tenant-id suffix)
+ *  - FIX: correct Teams reply token scope
+ *  - FIX: correct serviceUrl normalization (removes invalid tenant-id suffix)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -174,15 +174,14 @@ function normalizeServiceUrl(raw: string): string {
   if (!raw) return "";
 
   let url = raw.trim();
-  url = url.replace(/\/+$/, "");      // strip trailing slash
-  url = url.split("?")[0];            // remove any query params
+  url = url.replace(/\/+$/, ""); // strip trailing slash
+  url = url.split("?")[0];       // remove params
 
   const emeaPrefix = "https://smba.trafficmanager.net/emea";
 
+  // FIX: Teams incorrectly appends AAD tenant ID sometimes
   if (url.startsWith(emeaPrefix + "/")) {
     const suffix = url.slice(emeaPrefix.length + 1);
-
-    // if last path segment is a GUID => it's invalid Teams tenantId segment
     if (/^[0-9a-fA-F-]{36}$/.test(suffix)) {
       console.log("⚠️ Removing invalid tenant segment from serviceUrl:", suffix);
       url = emeaPrefix;
@@ -193,34 +192,47 @@ function normalizeServiceUrl(raw: string): string {
 }
 
 /********************************************************************************************
- * BOTFRAMEWORK TOKEN
+ * FIXED BOTFRAMEWORK TOKEN REQUEST (correct scope)
  ********************************************************************************************/
-async function getBotFrameworkToken(id: string, secret: string) {
-  console.log("🔍 BF TOKEN REQUEST for bot:", id);
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: id,
-    client_secret: secret,
-    scope: "https://api.botframework.com/.default",
-  });
+async function getBotFrameworkToken(botAppId: string, botAppPassword: string): Promise<string> {
+  console.log("🔍 BF TOKEN REQUEST for bot:", botAppId);
 
-  const res = await fetch(
-    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
-    { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }
-  );
+  async function requestToken(scope: string) {
+    const body = new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: botAppId,
+      client_secret: botAppPassword,
+      scope,
+    });
 
-  if (!res.ok) {
-    console.error("❌ BF TOKEN ERROR:", await res.text());
-    throw new Error("bf-token");
+    const res = await fetch(
+      "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body,
+      }
+    );
+
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json.access_token;
   }
 
+  // Try new scope first (required in many EU tenants)
+  let token = await requestToken("urn:microsoft.com:botframework:oauth2");
+
+  // Fallback to legacy documented scope
+  if (!token) token = await requestToken("https://api.botframework.com/.default");
+
+  if (!token) throw new Error("bf-token-acquisition-failed");
+
   console.log("✅ BF TOKEN ACQUIRED");
-  const json = await res.json();
-  return json.access_token;
+  return token;
 }
 
 /********************************************************************************************
- * SEND TEAMS REPLY (PATChed)
+ * SEND TEAMS REPLY (FULL PATCH)
  ********************************************************************************************/
 async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any) {
   console.log("📝 FULL ACTIVITY:", JSON.stringify(activity, null, 2));
@@ -235,14 +247,16 @@ async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any)
     return;
   }
 
-  // FIXED serviceUrl
+  // Correct serviceUrl
   const serviceUrl = normalizeServiceUrl(activity.serviceUrl);
   console.log("🔍 Normalized serviceUrl:", serviceUrl);
 
-  // Token for reply
+  // Acquire Teams token
   const token = await getBotFrameworkToken(creds.bot_app_id, creds.bot_app_password);
 
-  const url = `${serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities`;
+  const url =
+    `${serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities`;
+
   console.log("🔍 Teams reply URL:", url);
 
   const payload = {
@@ -260,6 +274,7 @@ async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any)
   });
 
   const body = await res.text();
+
   if (!res.ok) {
     console.error("❌ REPLY ERROR", res.status, body);
   } else {
@@ -276,7 +291,7 @@ async function handleTeams(req: Request): Promise<Response> {
 
   console.log("🔔 Incoming Teams POST");
 
-  // 1) JWT validation
+  // 1. JWT validation
   let creds;
   try {
     creds = await verifyBotFrameworkJwt(req.headers.get("Authorization"));
@@ -285,7 +300,7 @@ async function handleTeams(req: Request): Promise<Response> {
     return new Response("unauthorized", { status: 401 });
   }
 
-  // 2) Parse body
+  // 2. Parse incoming activity
   let activity: TeamsActivity;
   try {
     activity = await req.json();
@@ -301,17 +316,17 @@ async function handleTeams(req: Request): Promise<Response> {
     return new Response("ignored");
   }
 
+  // 3. Resolve tenant
   const aadTenantId = activity.channelData?.tenant?.id;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // 3) Resolve Innsyn tenant
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) {
     await sendTeamsReply(activity, "⚠️ InnsynAI is not configured for your Microsoft 365 tenant.", creds);
     return new Response("no tenant");
   }
 
-  // 4) RAG
+  // 4. RAG query
   let rag;
   try {
     rag = await callRagQuery(tenantId, activity.text.trim());
@@ -320,7 +335,7 @@ async function handleTeams(req: Request): Promise<Response> {
     return new Response("rag error");
   }
 
-  // 5) Reply
+  // 5. Reply to user
   await sendTeamsReply(activity, rag?.answer ?? "No answer found.", creds);
   return new Response("ok");
 }
