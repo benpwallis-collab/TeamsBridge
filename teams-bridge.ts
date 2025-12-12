@@ -1,11 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL CLEAN VERSION
- *
- * ✔ Adaptive Card ONLY (no text duplication)
- * ✔ Sources rendered
- * ✔ No repeated question
- * ✔ 👍 / 👎 feedback wired to analytics
- * ✔ Existing auth / tenant / BF logic preserved
+ * InnsynAI Teams Bridge – FINAL (Feedback-Correct, Prod-Safe)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -36,8 +30,8 @@ let jwks: jose.JSONWebKeySet | null = null;
 
 async function getJwks(): Promise<jose.JSONWebKeySet> {
   if (jwks) return jwks;
-  const meta = await fetch(OPENID_CONFIG_URL).then((r) => r.json());
-  jwks = await fetch(meta.jwks_uri).then((r) => r.json());
+  const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
+  jwks = await fetch(meta.jwks_uri).then(r => r.json());
   return jwks!;
 }
 
@@ -113,10 +107,11 @@ type RagResponse = {
   confidence?: number;
   reviewed?: boolean;
   sources?: { title?: string; url?: string }[];
+  qa_log_id?: string; // ✅ REQUIRED FOR FEEDBACK
 };
 
 /********************************************************************************************
- * RAG
+ * RAG QUERY
  ********************************************************************************************/
 async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
   const res = await fetch(RAG_QUERY_URL, {
@@ -137,9 +132,13 @@ async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
 }
 
 /********************************************************************************************
- * ADAPTIVE CARD BUILDER
+ * ADAPTIVE CARD BUILDER (qa_log_id aware)
  ********************************************************************************************/
-function buildAdaptiveCard(rag: RagResponse, tenantId: string) {
+function buildAdaptiveCard(
+  rag: RagResponse,
+  tenantId: string,
+  qaLogId?: string,
+) {
   const facts: any[] = [];
   if (typeof rag.confidence === "number") {
     facts.push({ title: "Confidence", value: `${Math.round(rag.confidence * 100)}%` });
@@ -152,7 +151,7 @@ function buildAdaptiveCard(rag: RagResponse, tenantId: string) {
     rag.sources?.length
       ? [
           { type: "TextBlock", text: "Sources", weight: "Bolder", spacing: "Medium" },
-          ...rag.sources.slice(0, 8).map((s) => ({
+          ...rag.sources.slice(0, 8).map(s => ({
             type: "TextBlock",
             text: `• [${s.title ?? "Source"}](${s.url})`,
             wrap: true,
@@ -160,6 +159,31 @@ function buildAdaptiveCard(rag: RagResponse, tenantId: string) {
           })),
         ]
       : [];
+
+  const feedbackActions = qaLogId
+    ? [
+        {
+          type: "Action.Submit",
+          title: "👍 Helpful",
+          data: {
+            action: "feedback",
+            feedback: "up",
+            tenant_id: tenantId,
+            qa_log_id: qaLogId,
+          },
+        },
+        {
+          type: "Action.Submit",
+          title: "👎 Not helpful",
+          data: {
+            action: "feedback",
+            feedback: "down",
+            tenant_id: tenantId,
+            qa_log_id: qaLogId,
+          },
+        },
+      ]
+    : [];
 
   return {
     $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -170,23 +194,12 @@ function buildAdaptiveCard(rag: RagResponse, tenantId: string) {
       ...(facts.length ? [{ type: "FactSet", facts }] : []),
       ...(sourceBlocks.length ? [{ type: "Container", items: sourceBlocks }] : []),
     ],
-    actions: [
-      {
-        type: "Action.Submit",
-        title: "👍 Helpful",
-        data: { action: "feedback", rating: "up", tenantId },
-      },
-      {
-        type: "Action.Submit",
-        title: "👎 Not helpful",
-        data: { action: "feedback", rating: "down", tenantId },
-      },
-    ],
+    actions: feedbackActions,
   };
 }
 
 /********************************************************************************************
- * SEND REPLY
+ * SEND TEAMS REPLY (CARD ONLY)
  ********************************************************************************************/
 async function sendTeamsReply(
   activity: TeamsActivity,
@@ -247,20 +260,29 @@ async function handleTeams(req: Request): Promise<Response> {
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // 👍 / 👎 Feedback
+  // 👍👎 FEEDBACK HANDLER (CORRECT SCHEMA)
   if (activity.value?.action === "feedback") {
-    await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
+    console.log("👍👎 Feedback received:", activity.value);
+
+    const res = await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         apikey: SUPABASE_ANON_KEY,
-        "x-tenant-id": activity.value.tenantId,
+        "x-internal-token": INTERNAL_LOOKUP_SECRET, // ✅ REQUIRED
       },
       body: JSON.stringify({
+        qa_log_id: activity.value.qa_log_id,
+        feedback: activity.value.feedback,
+        tenant_id: activity.value.tenant_id,
         source: "teams",
-        rating: activity.value.rating,
       }),
     });
+
+    if (!res.ok) {
+      console.error("❌ Feedback failed:", res.status, await res.text());
+    }
+
     return new Response("feedback ok");
   }
 
@@ -270,7 +292,7 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!tenantId) return new Response("no tenant");
 
   const rag = await callRagQuery(tenantId, activity.text.trim());
-  const card = buildAdaptiveCard(rag, tenantId);
+  const card = buildAdaptiveCard(rag, tenantId, rag.qa_log_id);
 
   await sendTeamsReply(activity, card, creds, aadTenantId);
   return new Response("ok");
@@ -279,7 +301,7 @@ async function handleTeams(req: Request): Promise<Response> {
 /********************************************************************************************
  * SERVER
  ********************************************************************************************/
-serve((req) => {
+serve(req => {
   const url = new URL(req.url);
   if (url.pathname === "/teams") return handleTeams(req);
   return new Response("ok");
