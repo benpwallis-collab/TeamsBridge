@@ -85,7 +85,9 @@ async function resolveByBotAppId(botAppId: string) {
 }
 
 // Existing → Resolve using AAD tenant ID
-async function resolveInnsynTenantId(aadTenantId: string): Promise<string | null> {
+async function resolveInnsynTenantId(
+  aadTenantId: string,
+): Promise<string | null> {
   console.log("🔍 Resolving InnsynAI tenant for AAD tenant:", aadTenantId);
 
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
@@ -160,6 +162,8 @@ interface TeamsActivity {
   channelData?: {
     tenant?: { id?: string }; // AAD tenant ID
   };
+  // We keep the rest flexible; we just log the raw JSON for debugging.
+  [key: string]: unknown;
 }
 
 /********************************************************************************************
@@ -192,7 +196,10 @@ async function callRagQuery(tenantId: string, question: string) {
 /********************************************************************************************
  * REPLY TO TEAMS (USING PER-TENANT BOT CREDENTIALS)
  ********************************************************************************************/
-async function getBotFrameworkToken(botAppId: string, botAppPassword: string): Promise<string> {
+async function getBotFrameworkToken(
+  botAppId: string,
+  botAppPassword: string,
+): Promise<string> {
   console.log("🔍 BF TOKEN REQUEST for bot:", botAppId);
 
   const body = new URLSearchParams({
@@ -204,7 +211,11 @@ async function getBotFrameworkToken(botAppId: string, botAppPassword: string): P
 
   const res = await fetch(
     "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
-    { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body }
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    },
   );
 
   if (!res.ok) {
@@ -217,27 +228,94 @@ async function getBotFrameworkToken(botAppId: string, botAppPassword: string): P
   return json.access_token;
 }
 
-async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any) {
-  if (!activity.serviceUrl || !activity.conversation?.id) return;
+/**
+ * Drop-in replacement: improved logging + strict serviceUrl handling.
+ */
+async function sendTeamsReply(
+  activity: TeamsActivity,
+  text: string,
+  creds: any,
+) {
+  if (!activity) {
+    console.error("❌ No activity passed to sendTeamsReply");
+    return;
+  }
 
-  console.log("🔍 Sending reply using bot:", creds.bot_app_id);
+  console.log("📝 FULL ACTIVITY:", JSON.stringify(activity, null, 2));
 
-  const token = await getBotFrameworkToken(creds.bot_app_id, creds.bot_app_password);
-  const serviceUrl = activity.serviceUrl.replace(/\/+$/, "");
-  const url = `${serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities`;
+  if (!activity.serviceUrl) {
+    console.error("❌ Missing serviceUrl in incoming activity");
+    return;
+  }
 
-  const payload = { type: "message", text, replyToId: activity.replyToId ?? activity.id };
+  if (!activity.conversation?.id) {
+    console.error("❌ Missing conversationId in incoming activity");
+    return;
+  }
 
-  const res = await fetch(url, {
+  // ---------------------------------------------------------------------------
+  // 1. Normalize serviceUrl exactly as MS requires
+  // ---------------------------------------------------------------------------
+  let serviceUrl = String(activity.serviceUrl).trim();
+
+  // Remove trailing slash(es)
+  serviceUrl = serviceUrl.replace(/\/+$/, "");
+
+  // Remove any querystring noise
+  serviceUrl = serviceUrl.split("?")[0];
+
+  console.log("🔍 Normalized serviceUrl:", serviceUrl);
+
+  // ---------------------------------------------------------------------------
+  // 2. Acquire BotFramework token
+  // ---------------------------------------------------------------------------
+  const token = await getBotFrameworkToken(
+    creds.bot_app_id,
+    creds.bot_app_password,
+  );
+
+  // ---------------------------------------------------------------------------
+  // 3. Construct precise reply endpoint
+  // ---------------------------------------------------------------------------
+  const conversationId = encodeURIComponent(activity.conversation.id);
+  const replyUrl =
+    `${serviceUrl}/v3/conversations/${conversationId}/activities`;
+
+  console.log("🔍 Teams reply URL:", replyUrl);
+
+  // ---------------------------------------------------------------------------
+  // 4. Build payload according to Teams rules
+  // ---------------------------------------------------------------------------
+  const payload: Record<string, unknown> = {
+    type: "message",
+    text,
+  };
+
+  const replyToId = activity.replyToId ?? activity.id;
+  if (replyToId) {
+    payload.replyToId = replyToId;
+  }
+
+  console.log("📤 Reply payload:", payload);
+
+  // ---------------------------------------------------------------------------
+  // 5. Send reply
+  // ---------------------------------------------------------------------------
+  const res = await fetch(replyUrl, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify(payload),
   });
 
+  const body = await res.text();
+
   if (!res.ok) {
-    console.error("❌ REPLY ERROR", await res.text());
+    console.error("❌ REPLY ERROR", res.status, body);
   } else {
-    console.log("✅ Reply sent");
+    console.log("✅ Reply sent:", body);
   }
 }
 
@@ -246,7 +324,9 @@ async function sendTeamsReply(activity: TeamsActivity, text: string, creds: any)
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
   if (req.method === "GET") return new Response("ok");
-  if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
+  if (req.method !== "POST") {
+    return new Response("method not allowed", { status: 405 });
+  }
 
   console.log("🔔 Incoming Teams POST");
 
@@ -260,24 +340,54 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   // 2) Parse activity
-  const activity = (await req.json()) as TeamsActivity;
-  if (activity.type !== "message" || !activity.text) return new Response("ignored");
+  let activity: TeamsActivity;
+  try {
+    activity = (await req.json()) as TeamsActivity;
+  } catch (err) {
+    console.error("❌ Failed to parse JSON body:", err);
+    return new Response("bad request", { status: 400 });
+  }
+
+  console.log("📝 FULL RAW ACTIVITY:", JSON.stringify(activity, null, 2));
+
+  if (activity.type !== "message" || !activity.text) {
+    console.log("ℹ️ Non-message or empty text activity, ignoring.");
+    return new Response("ignored");
+  }
 
   const aadTenantId = activity.channelData?.tenant?.id;
-  if (!aadTenantId) return new Response("bad request", { status: 400 });
+  if (!aadTenantId) {
+    console.error("❌ Missing AAD tenant ID in channelData.tenant.id");
+    return new Response("bad request", { status: 400 });
+  }
 
   // 3) Resolve Innsyn tenant by AAD tenant
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) {
-    await sendTeamsReply(activity, "⚠️ InnsynAI is not configured for this Microsoft 365 tenant.", creds);
+    await sendTeamsReply(
+      activity,
+      "⚠️ InnsynAI is not configured for this Microsoft 365 tenant.",
+      creds,
+    );
     return new Response("no tenant mapping");
   }
 
   // 4) Call RAG
   let rag;
   try {
-    rag = await callRagQuery(tenantId, activity.text.trim());
-  } catch {
+    const question = activity.text.trim();
+    if (!question) {
+      await sendTeamsReply(
+        activity,
+        "❓ Please send a non-empty question.",
+        creds,
+      );
+      return new Response("empty question");
+    }
+
+    rag = await callRagQuery(tenantId, question);
+  } catch (err) {
+    console.error("❌ RAG call failed:", err);
     await sendTeamsReply(activity, "❌ Something went wrong.", creds);
     return new Response("rag error");
   }
