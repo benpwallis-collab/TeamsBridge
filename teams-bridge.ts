@@ -1,16 +1,11 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – Tenant-Aware, Fully Patched Version
+ * InnsynAI Teams Bridge – Tenant-Aware, Sources+AdaptiveCard Version (FULL REPLACEMENT)
  *
- * - Multi-tenant BotFramework JWT validation (aud = customer's Bot App ID)
- * - Resolve bot_app_id → Innsyn tenant (Lovable resolver)
- * - Resolve AAD tenant → Innsyn tenant (Lovable resolver)
- * - Call RAG via anon key + x-tenant-id
- * - Reply to Teams using per-tenant bot credentials
- *
- * Key fixes:
- *  - Correct serviceUrl normalization (remove invalid tenant-id suffix)
- *  - Use AAD tenant-specific token endpoint (not botframework.com) for BF access token
- *  - Use official scope: https://api.botframework.com/.default
+ * Fixes implemented:
+ *  ✅ Log FULL RAG payload (so you can confirm sources/confidence/reviewed)
+ *  ✅ Reply using Adaptive Card (with Sources rendered) + text fallback
+ *  ✅ Keep existing: multi-tenant BF JWT validation, tenant resolvers, serviceUrl normalization,
+ *     AAD-tenant token endpoint + BotFramework scope.
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -30,8 +25,10 @@ console.log("🔧 TEAMS BRIDGE STARTUP");
 console.log("  TEAMS_TENANT_LOOKUP_URL:", TEAMS_TENANT_LOOKUP_URL);
 console.log("  RAG_QUERY_URL:", RAG_QUERY_URL);
 
-if (!INTERNAL_LOOKUP_SECRET || !TEAMS_TENANT_LOOKUP_URL ||
-    !RAG_QUERY_URL || !SUPABASE_ANON_KEY) {
+if (
+  !INTERNAL_LOOKUP_SECRET || !TEAMS_TENANT_LOOKUP_URL ||
+  !RAG_QUERY_URL || !SUPABASE_ANON_KEY
+) {
   console.error("❌ Missing env vars");
   Deno.exit(1);
 }
@@ -47,8 +44,8 @@ let jwks: jose.JSONWebKeySet | null = null;
 async function getJwks(): Promise<jose.JSONWebKeySet> {
   if (jwks) return jwks;
   console.log("🔍 Fetching BotFramework OpenID configuration");
-  const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
-  jwks = await fetch(meta.jwks_uri).then(r => r.json());
+  const meta = await fetch(OPENID_CONFIG_URL).then((r) => r.json());
+  jwks = await fetch(meta.jwks_uri).then((r) => r.json());
   console.log("✅ JWKS loaded");
   return jwks!;
 }
@@ -106,15 +103,15 @@ async function resolveInnsynTenantId(aadTenantId: string) {
  * MULTI-TENANT BF JWT VALIDATION (INBOUND)
  ********************************************************************************************/
 async function verifyBotFrameworkJwt(authHeader: string | null) {
-  if (!authHeader?.startsWith("Bearer "))
-    throw new Error("Missing auth header");
+  if (!authHeader?.startsWith("Bearer ")) throw new Error("Missing auth header");
 
   const token = authHeader.slice("Bearer ".length);
   const decoded = jose.decodeJwt(token);
 
   const botAppId = decoded.aud;
-  if (!botAppId || typeof botAppId !== "string")
+  if (!botAppId || typeof botAppId !== "string") {
     throw new Error("Missing or invalid aud in BF JWT");
+  }
 
   console.log("🔍 Incoming bot App ID (aud):", botAppId);
 
@@ -151,10 +148,27 @@ interface TeamsActivity {
   [key: string]: unknown;
 }
 
+type RagSource = {
+  title?: string;
+  url?: string;
+  source_url?: string; // some pipelines use snake_case
+  sourceUrl?: string;  // some pipelines use camelCase
+  name?: string;
+};
+
+type RagResponse = {
+  answer?: string;
+  confidence?: number;
+  reviewed?: boolean;
+  sources?: RagSource[];
+  // allow extra fields without failing
+  [key: string]: unknown;
+};
+
 /********************************************************************************************
  * RAG QUERY
  ********************************************************************************************/
-async function callRagQuery(tenantId: string, q: string) {
+async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
   console.log("🔍 Calling RAG for tenant:", tenantId, "question:", q);
 
   const res = await fetch(RAG_QUERY_URL, {
@@ -172,8 +186,20 @@ async function callRagQuery(tenantId: string, q: string) {
     throw new Error("rag");
   }
 
+  const json = (await res.json()) as RagResponse;
+
+  // ✅ CRITICAL: log what we actually got back (answer/confidence/sources/etc.)
   console.log("✅ RAG response received");
-  return res.json();
+  console.log("🧾 RAG FULL RESPONSE:", JSON.stringify(json, null, 2));
+
+  // convenience logging for quick scanning
+  const sourcesCount = Array.isArray(json.sources) ? json.sources.length : 0;
+  console.log("📚 RAG sources count:", sourcesCount);
+  if (sourcesCount > 0) {
+    console.log("📚 RAG sources sample:", JSON.stringify(json.sources?.slice(0, 3), null, 2));
+  }
+
+  return json;
 }
 
 /********************************************************************************************
@@ -184,7 +210,7 @@ function normalizeServiceUrl(raw: string): string {
 
   let url = raw.trim();
   url = url.replace(/\/+$/, ""); // strip trailing slash
-  url = url.split("?")[0];       // remove params
+  url = url.split("?")[0]; // remove params
 
   const emeaPrefix = "https://smba.trafficmanager.net/emea";
 
@@ -202,9 +228,6 @@ function normalizeServiceUrl(raw: string): string {
 
 /********************************************************************************************
  * BOTFRAMEWORK TOKEN (OUTBOUND) – TENANT-SPECIFIC
- *
- * Updated per MS guidance: use your own AAD tenant, not botframework.com,
- * with scope = https://api.botframework.com/.default
  ********************************************************************************************/
 async function getBotFrameworkToken(
   botAppId: string,
@@ -250,7 +273,6 @@ async function getBotFrameworkToken(
     throw new Error("bf-token-missing-access-token");
   }
 
-  // Log key claims (no secret)
   try {
     const decoded = jose.decodeJwt(accessToken);
     console.log("🔍 BF ACCESS TOKEN PAYLOAD (truncated):", {
@@ -270,11 +292,97 @@ async function getBotFrameworkToken(
 }
 
 /********************************************************************************************
- * SEND TEAMS REPLY
+ * ADAPTIVE CARD BUILDER (Answer + Confidence + Reviewed + Sources)
+ ********************************************************************************************/
+function coerceSourceUrl(s: RagSource): string | undefined {
+  return (s.url || s.source_url || (s as any).sourceUrl || (s as any).sourceURL) as string | undefined;
+}
+
+function coerceSourceTitle(s: RagSource): string {
+  return (s.title || s.name || "Source") as string;
+}
+
+function buildAdaptiveCard(rag: RagResponse, question: string) {
+  const answer = (rag.answer ?? "No answer found.").toString();
+  const confidence =
+    typeof rag.confidence === "number" ? Math.round(rag.confidence * 100) : null;
+  const reviewed = rag.reviewed === true;
+
+  const sources = Array.isArray(rag.sources) ? rag.sources : [];
+  const sourceBlocks: any[] = [];
+
+  if (sources.length > 0) {
+    sourceBlocks.push({
+      type: "TextBlock",
+      text: "Sources",
+      weight: "Bolder",
+      spacing: "Medium",
+      wrap: true,
+    });
+
+    for (const s of sources.slice(0, 8)) {
+      const title = coerceSourceTitle(s);
+      const url = coerceSourceUrl(s);
+
+      // Teams Adaptive Card supports markdown links in TextBlock
+      const line = url ? `• [${title}](${url})` : `• ${title}`;
+
+      sourceBlocks.push({
+        type: "TextBlock",
+        text: line,
+        wrap: true,
+        spacing: "None",
+      });
+    }
+  }
+
+  const metaFacts: any[] = [];
+  if (confidence !== null) metaFacts.push({ title: "Confidence", value: `${confidence}%` });
+  if (reviewed) metaFacts.push({ title: "Reviewed", value: "Yes" });
+
+  return {
+    $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
+    type: "AdaptiveCard",
+    version: "1.4",
+    body: [
+      {
+        type: "TextBlock",
+        text: answer,
+        wrap: true,
+        size: "Medium",
+      },
+      ...(metaFacts.length > 0
+        ? [{
+          type: "FactSet",
+          facts: metaFacts,
+          spacing: "Medium",
+        }]
+        : []),
+      ...(sourceBlocks.length > 0
+        ? [{
+          type: "Container",
+          spacing: "Medium",
+          items: sourceBlocks,
+        }]
+        : []),
+      // Optional: show the question (helps debugging / context)
+      {
+        type: "TextBlock",
+        text: `_${question}_`,
+        isSubtle: true,
+        wrap: true,
+        spacing: "Medium",
+      },
+    ],
+  };
+}
+
+/********************************************************************************************
+ * SEND TEAMS REPLY (Adaptive Card + text fallback)
  ********************************************************************************************/
 async function sendTeamsReply(
   activity: TeamsActivity,
-  text: string,
+  rag: RagResponse,
   creds: any,
   aadTenantId: string,
 ) {
@@ -284,7 +392,6 @@ async function sendTeamsReply(
     console.error("❌ No serviceUrl");
     return;
   }
-
   if (!activity.conversation?.id) {
     console.error("❌ No conversation.id");
     return;
@@ -304,13 +411,26 @@ async function sendTeamsReply(
 
   console.log("🔍 Teams reply URL:", replyUrl);
 
-  const payload = {
+  const question = (activity.text ?? "").toString().trim();
+  const answerText = (rag.answer ?? "No answer found.").toString();
+
+  // ✅ Prefer Adaptive Card
+  const card = buildAdaptiveCard(rag, question);
+
+  const payload: any = {
     type: "message",
-    text,
+    // Text fallback (shows in notifications / if card fails)
+    text: answerText,
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: card,
+      },
+    ],
     replyToId: activity.replyToId ?? activity.id,
   };
 
-  console.log("📤 Reply payload:", payload);
+  console.log("📤 Reply payload (card+text):", JSON.stringify(payload, null, 2));
 
   const res = await fetch(replyUrl, {
     method: "POST",
@@ -335,9 +455,7 @@ async function sendTeamsReply(
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
   if (req.method === "GET") return new Response("ok");
-  if (req.method !== "POST") {
-    return new Response("method not allowed", { status: 405 });
-  }
+  if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
 
   console.log("🔔 Incoming Teams POST");
 
@@ -378,37 +496,25 @@ async function handleTeams(req: Request): Promise<Response> {
   // 3) Resolve Innsyn tenant
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) {
-    await sendTeamsReply(
-      activity,
-      "⚠️ InnsynAI is not configured for your Microsoft 365 tenant.",
-      creds,
-      aadTenantId,
-    );
+    // still reply, but keep it simple (no rag)
+    const rag: RagResponse = { answer: "⚠️ InnsynAI is not configured for your Microsoft 365 tenant." };
+    await sendTeamsReply(activity, rag, creds, aadTenantId);
     return new Response("no tenant");
   }
 
   // 4) Call RAG
-  let rag;
+  let rag: RagResponse;
   try {
     rag = await callRagQuery(tenantId, activity.text.trim());
   } catch (e) {
     console.error("❌ RAG failed:", e);
-    await sendTeamsReply(
-      activity,
-      "❌ Something went wrong.",
-      creds,
-      aadTenantId,
-    );
+    rag = { answer: "❌ Something went wrong while fetching the answer." };
+    await sendTeamsReply(activity, rag, creds, aadTenantId);
     return new Response("rag error");
   }
 
-  // 5) Reply with answer
-  await sendTeamsReply(
-    activity,
-    rag?.answer ?? "No answer found.",
-    creds,
-    aadTenantId,
-  );
+  // 5) Reply (Adaptive Card + sources)
+  await sendTeamsReply(activity, rag, creds, aadTenantId);
 
   return new Response("ok");
 }
