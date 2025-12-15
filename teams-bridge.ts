@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (Feedback-Correct, Prod-Safe)
+ * InnsynAI Teams Bridge – FINAL (with Human Answer Capture)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -13,9 +13,16 @@ const {
   TEAMS_TENANT_LOOKUP_URL,
   RAG_QUERY_URL,
   SUPABASE_ANON_KEY,
+  SUPABASE_URL,
 } = Deno.env.toObject();
 
-if (!INTERNAL_LOOKUP_SECRET || !TEAMS_TENANT_LOOKUP_URL || !RAG_QUERY_URL || !SUPABASE_ANON_KEY) {
+if (
+  !INTERNAL_LOOKUP_SECRET ||
+  !TEAMS_TENANT_LOOKUP_URL ||
+  !RAG_QUERY_URL ||
+  !SUPABASE_ANON_KEY ||
+  !SUPABASE_URL
+) {
   console.error("❌ Missing env vars");
   Deno.exit(1);
 }
@@ -36,7 +43,7 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
 }
 
 /********************************************************************************************
- * RESOLVERS
+ * TENANT RESOLUTION
  ********************************************************************************************/
 async function resolveByBotAppId(botAppId: string) {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
@@ -95,6 +102,7 @@ interface TeamsActivity {
   type: string;
   id?: string;
   text?: string;
+  from?: { id?: string };
   value?: any;
   serviceUrl?: string;
   replyToId?: string;
@@ -107,7 +115,7 @@ type RagResponse = {
   confidence?: number;
   reviewed?: boolean;
   sources?: { title?: string; url?: string }[];
-  qa_log_id?: string; // ✅ REQUIRED FOR FEEDBACK
+  qa_log_id?: string;
 };
 
 /********************************************************************************************
@@ -125,20 +133,53 @@ async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
   });
 
   if (!res.ok) throw new Error("RAG failed");
-
-  const json = await res.json();
-  console.log("🧾 RAG FULL RESPONSE:", JSON.stringify(json, null, 2));
-  return json;
+  return res.json();
 }
 
 /********************************************************************************************
- * ADAPTIVE CARD BUILDER (qa_log_id aware)
+ * HUMAN ANSWER CAPTURE (FIRE & FORGET)
  ********************************************************************************************/
-function buildAdaptiveCard(
-  rag: RagResponse,
+function fireHumanAnswerCapture(
   tenantId: string,
-  qaLogId?: string,
+  aadTenantId: string,
+  activity: TeamsActivity,
 ) {
+  try {
+    if (!activity.text || !activity.conversation?.id || !activity.id) return;
+
+    fetch(`${SUPABASE_URL}/functions/v1/capture-human-answers`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+      },
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        source_type: "teams",
+        teams_tenant_id: aadTenantId,
+        thread_messages: [
+          {
+            user_id: activity.from?.id ?? "unknown",
+            text: activity.text,
+            timestamp: new Date().toISOString(),
+            is_bot: false,
+          },
+        ],
+        source_reference: {
+          conversation_id: activity.conversation.id,
+          activity_id: activity.id,
+        },
+      }),
+    });
+  } catch {
+    // HARD NO-OP: must never affect Teams flow
+  }
+}
+
+/********************************************************************************************
+ * ADAPTIVE CARD BUILDER
+ ********************************************************************************************/
+function buildAdaptiveCard(rag: RagResponse, tenantId: string, qaLogId?: string) {
   const facts: any[] = [];
   if (typeof rag.confidence === "number") {
     facts.push({ title: "Confidence", value: `${Math.round(rag.confidence * 100)}%` });
@@ -147,7 +188,7 @@ function buildAdaptiveCard(
     facts.push({ title: "Reviewed", value: "Yes" });
   }
 
-  const sourceBlocks =
+  const sources =
     rag.sources?.length
       ? [
           { type: "TextBlock", text: "Sources", weight: "Bolder", spacing: "Medium" },
@@ -160,53 +201,38 @@ function buildAdaptiveCard(
         ]
       : [];
 
-  const feedbackActions = qaLogId
-    ? [
-        {
-          type: "Action.Submit",
-          title: "👍 Helpful",
-          data: {
-            action: "feedback",
-            feedback: "up",
-            tenant_id: tenantId,
-            qa_log_id: qaLogId,
+  const feedback =
+    qaLogId
+      ? [
+          {
+            type: "Action.Submit",
+            title: "👍 Helpful",
+            data: { action: "feedback", feedback: "up", tenant_id: tenantId, qa_log_id: qaLogId },
           },
-        },
-        {
-          type: "Action.Submit",
-          title: "👎 Not helpful",
-          data: {
-            action: "feedback",
-            feedback: "down",
-            tenant_id: tenantId,
-            qa_log_id: qaLogId,
+          {
+            type: "Action.Submit",
+            title: "👎 Not helpful",
+            data: { action: "feedback", feedback: "down", tenant_id: tenantId, qa_log_id: qaLogId },
           },
-        },
-      ]
-    : [];
+        ]
+      : [];
 
   return {
-    $schema: "http://adaptivecards.io/schemas/adaptive-card.json",
     type: "AdaptiveCard",
     version: "1.4",
     body: [
       { type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true },
       ...(facts.length ? [{ type: "FactSet", facts }] : []),
-      ...(sourceBlocks.length ? [{ type: "Container", items: sourceBlocks }] : []),
+      ...(sources.length ? [{ type: "Container", items: sources }] : []),
     ],
-    actions: feedbackActions,
+    actions: feedback,
   };
 }
 
 /********************************************************************************************
- * SEND TEAMS REPLY (CARD ONLY)
+ * SEND TEAMS REPLY
  ********************************************************************************************/
-async function sendTeamsReply(
-  activity: TeamsActivity,
-  card: any,
-  creds: any,
-  aadTenantId: string,
-) {
+async function sendTeamsReply(activity: TeamsActivity, card: any, creds: any, aadTenantId: string) {
   const tokenRes = await fetch(
     `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
@@ -223,28 +249,28 @@ async function sendTeamsReply(
 
   const { access_token } = await tokenRes.json();
 
-  const replyUrl =
+  await fetch(
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation!.id,
-    )}/activities`;
-
-  await fetch(replyUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${access_token}`,
-      "Content-Type": "application/json",
+    )}/activities`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        type: "message",
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: card,
+          },
+        ],
+        replyToId: activity.replyToId ?? activity.id,
+      }),
     },
-    body: JSON.stringify({
-      type: "message",
-      attachments: [
-        {
-          contentType: "application/vnd.microsoft.card.adaptive",
-          content: card,
-        },
-      ],
-      replyToId: activity.replyToId ?? activity.id,
-    }),
-  });
+  );
 }
 
 /********************************************************************************************
@@ -260,36 +286,27 @@ async function handleTeams(req: Request): Promise<Response> {
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // 👍👎 FEEDBACK HANDLER (CORRECT SCHEMA)
+  // Feedback
   if (activity.value?.action === "feedback") {
-    console.log("👍👎 Feedback received:", activity.value);
-
-    const res = await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
+    await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         apikey: SUPABASE_ANON_KEY,
-        "x-internal-token": INTERNAL_LOOKUP_SECRET, // ✅ REQUIRED
+        "x-internal-token": INTERNAL_LOOKUP_SECRET,
       },
-      body: JSON.stringify({
-        qa_log_id: activity.value.qa_log_id,
-        feedback: activity.value.feedback,
-        tenant_id: activity.value.tenant_id,
-        source: "teams",
-      }),
+      body: JSON.stringify(activity.value),
     });
-
-    if (!res.ok) {
-      console.error("❌ Feedback failed:", res.status, await res.text());
-    }
-
-    return new Response("feedback ok");
+    return new Response("ok");
   }
 
   if (!activity.text) return new Response("ignored");
 
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) return new Response("no tenant");
+
+  // 🔥 Fire-and-forget capture (NO await)
+  fireHumanAnswerCapture(tenantId, aadTenantId, activity);
 
   const rag = await callRagQuery(tenantId, activity.text.trim());
   const card = buildAdaptiveCard(rag, tenantId, rag.qa_log_id);
