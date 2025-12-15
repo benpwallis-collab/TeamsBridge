@@ -1,12 +1,12 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (with Human Answer Capture)
+ * InnsynAI Teams Bridge – FINAL (Human Answer Capture safe + fire-and-forget)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 
 /********************************************************************************************
- * ENV VARS
+ * ENV VARS (NO NEW ONES)
  ********************************************************************************************/
 const {
   INTERNAL_LOOKUP_SECRET,
@@ -99,15 +99,14 @@ async function verifyBotFrameworkJwt(authHeader: string | null) {
  * TYPES
  ********************************************************************************************/
 interface TeamsActivity {
-  type: string;
   id?: string;
   text?: string;
   from?: { id?: string };
-  value?: any;
   serviceUrl?: string;
   replyToId?: string;
   conversation?: { id: string; tenantId?: string };
   channelData?: { tenant?: { id?: string } };
+  value?: any;
 }
 
 type RagResponse = {
@@ -119,25 +118,7 @@ type RagResponse = {
 };
 
 /********************************************************************************************
- * RAG QUERY
- ********************************************************************************************/
-async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
-  const res = await fetch(RAG_QUERY_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      "x-tenant-id": tenantId,
-    },
-    body: JSON.stringify({ question: q, source: "teams" }),
-  });
-
-  if (!res.ok) throw new Error("RAG failed");
-  return res.json();
-}
-
-/********************************************************************************************
- * HUMAN ANSWER CAPTURE (FIRE & FORGET)
+ * HUMAN ANSWER CAPTURE (STRICT FIRE-AND-FORGET)
  ********************************************************************************************/
 function fireHumanAnswerCapture(
   tenantId: string,
@@ -170,39 +151,43 @@ function fireHumanAnswerCapture(
           activity_id: activity.id,
         },
       }),
+    }).catch(() => {
+      // absolute no-op
     });
   } catch {
-    // HARD NO-OP: must never affect Teams flow
+    // absolute no-op
   }
 }
 
 /********************************************************************************************
- * ADAPTIVE CARD BUILDER
+ * RAG QUERY
+ ********************************************************************************************/
+async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
+  const res = await fetch(RAG_QUERY_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      "x-tenant-id": tenantId,
+    },
+    body: JSON.stringify({ question: q, source: "teams" }),
+  });
+
+  if (!res.ok) throw new Error("RAG failed");
+  return res.json();
+}
+
+/********************************************************************************************
+ * ADAPTIVE CARD
  ********************************************************************************************/
 function buildAdaptiveCard(rag: RagResponse, tenantId: string, qaLogId?: string) {
-  const facts: any[] = [];
-  if (typeof rag.confidence === "number") {
-    facts.push({ title: "Confidence", value: `${Math.round(rag.confidence * 100)}%` });
-  }
-  if (rag.reviewed) {
-    facts.push({ title: "Reviewed", value: "Yes" });
-  }
-
-  const sources =
-    rag.sources?.length
-      ? [
-          { type: "TextBlock", text: "Sources", weight: "Bolder", spacing: "Medium" },
-          ...rag.sources.slice(0, 8).map(s => ({
-            type: "TextBlock",
-            text: `• [${s.title ?? "Source"}](${s.url})`,
-            wrap: true,
-            spacing: "None",
-          })),
-        ]
-      : [];
-
-  const feedback =
-    qaLogId
+  return {
+    type: "AdaptiveCard",
+    version: "1.4",
+    body: [
+      { type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true },
+    ],
+    actions: qaLogId
       ? [
           {
             type: "Action.Submit",
@@ -215,17 +200,7 @@ function buildAdaptiveCard(rag: RagResponse, tenantId: string, qaLogId?: string)
             data: { action: "feedback", feedback: "down", tenant_id: tenantId, qa_log_id: qaLogId },
           },
         ]
-      : [];
-
-  return {
-    type: "AdaptiveCard",
-    version: "1.4",
-    body: [
-      { type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true },
-      ...(facts.length ? [{ type: "FactSet", facts }] : []),
-      ...(sources.length ? [{ type: "Container", items: sources }] : []),
-    ],
-    actions: feedback,
+      : [],
   };
 }
 
@@ -286,7 +261,7 @@ async function handleTeams(req: Request): Promise<Response> {
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // Feedback
+  // Feedback passthrough
   if (activity.value?.action === "feedback") {
     await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
       method: "POST",
@@ -305,7 +280,7 @@ async function handleTeams(req: Request): Promise<Response> {
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) return new Response("no tenant");
 
-  // 🔥 Fire-and-forget capture (NO await)
+  // 🔥 capture (never awaited)
   fireHumanAnswerCapture(tenantId, aadTenantId, activity);
 
   const rag = await callRagQuery(tenantId, activity.text.trim());
@@ -319,7 +294,6 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  const url = new URL(req.url);
-  if (url.pathname === "/teams") return handleTeams(req);
+  if (new URL(req.url).pathname === "/teams") return handleTeams(req);
   return new Response("ok");
 });
