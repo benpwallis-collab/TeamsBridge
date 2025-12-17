@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (RAG + Feedback, strict & correct)
+ * InnsynAI Teams Bridge – FINAL (RAG + Feedback + Working-on-it update)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -107,144 +107,10 @@ interface TeamsActivity {
 }
 
 /********************************************************************************************
- * MAIN HANDLER
+ * HELPERS
  ********************************************************************************************/
-async function handleTeams(req: Request): Promise<Response> {
-  if (req.method !== "POST") return new Response("ok");
-
-  // ---- Safe parse ----
-  let activity: TeamsActivity;
-  try {
-    const raw = await req.text();
-    if (!raw) return new Response("ok");
-    activity = JSON.parse(raw);
-  } catch {
-    return new Response("ok");
-  }
-
-  console.log(
-    "📨 Activity:",
-    activity.type,
-    "| hasText:",
-    Boolean(activity.text),
-    "| hasValue:",
-    Boolean(activity.value),
-  );
-
-  // ---- JWT guard ----
-  const auth = req.headers.get("Authorization");
-  if (!auth) return new Response("ok");
-
-  let creds;
-  try {
-    creds = await verifyJwt(auth);
-  } catch (err) {
-    console.error("❌ JWT failed", err);
-    return new Response("unauthorized", { status: 401 });
-  }
-
-  const aadTenantId =
-    activity.channelData?.tenant?.id || activity.conversation?.tenantId;
-  if (!aadTenantId) return new Response("ok");
-
-  const tenantId = await resolveTenantId(aadTenantId);
-  if (!tenantId) return new Response("ok");
-
-  /****************************
-   * FEEDBACK PATH
-   ****************************/
-  if (activity.value?.action === "feedback") {
-    const payload = {
-      qa_log_id: activity.value.qa_log_id,
-      feedback: activity.value.feedback,
-      tenant_id: tenantId,
-      source: "teams",
-      teams_user_id: activity.value.teams_user_id ?? activity.from?.id ?? null,
-      comment: activity.value.comment ?? undefined,
-    };
-
-    console.log("➡️ Forwarding feedback", payload);
-
-    const res = await fetch(
-      RAG_QUERY_URL.replace("/rag-query", "/feedback"),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SUPABASE_ANON_KEY,
-          "x-internal-token": INTERNAL_LOOKUP_SECRET,
-        },
-        body: JSON.stringify(payload),
-      },
-    );
-
-    if (!res.ok) {
-      console.error("❌ Feedback failed", res.status, await res.text());
-    } else {
-      console.log("✅ Feedback saved");
-    }
-
-    return new Response("ok");
-  }
-
-  /****************************
-   * MESSAGE → RAG
-   ****************************/
-  if (!activity.text) return new Response("ok");
-
-  const ragRes = await fetch(RAG_QUERY_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      "x-tenant-id": tenantId,
-    },
-    body: JSON.stringify({
-      question: activity.text.trim(),
-      source: "teams",
-    }),
-  });
-
-  const rag = await ragRes.json();
-
-  console.log("🧠 RAG qa_log_id:", rag.qa_log_id);
-
-  /****************************
-   * BUILD ADAPTIVE CARD
-   ****************************/
-  const actions = rag.qa_log_id
-    ? [
-        {
-          type: "Action.Submit",
-          title: "👍 Helpful",
-          data: {
-            action: "feedback",
-            feedback: "up",
-            qa_log_id: rag.qa_log_id,
-            tenant_id: tenantId,
-            source: "teams",
-            teams_user_id: activity.from?.id ?? null,
-          },
-        },
-        {
-          type: "Action.Submit",
-          title: "👎 Not helpful",
-          data: {
-            action: "feedback",
-            feedback: "down",
-            qa_log_id: rag.qa_log_id,
-            tenant_id: tenantId,
-            source: "teams",
-            teams_user_id: activity.from?.id ?? null,
-          },
-        },
-      ]
-    : [];
-
-  /****************************
-   * SEND REPLY
-   ****************************/
-  const tokenRes = await fetch(
+async function getBotAccessToken(aadTenantId: string, creds: any) {
+  const res = await fetch(
     `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
       method: "POST",
@@ -257,42 +123,164 @@ async function handleTeams(req: Request): Promise<Response> {
       }),
     },
   );
+  return (await res.json()).access_token;
+}
 
-  const { access_token } = await tokenRes.json();
+/********************************************************************************************
+ * MAIN HANDLER
+ ********************************************************************************************/
+async function handleTeams(req: Request): Promise<Response> {
+  if (req.method !== "POST") return new Response("ok");
 
-  await fetch(
+  let activity: TeamsActivity;
+  try {
+    activity = JSON.parse(await req.text());
+  } catch {
+    return new Response("ok");
+  }
+
+  const auth = req.headers.get("Authorization");
+  if (!auth) return new Response("ok");
+
+  let creds;
+  try {
+    creds = await verifyJwt(auth);
+  } catch {
+    return new Response("unauthorized", { status: 401 });
+  }
+
+  const aadTenantId =
+    activity.channelData?.tenant?.id || activity.conversation?.tenantId;
+  if (!aadTenantId) return new Response("ok");
+
+  const tenantId = await resolveTenantId(aadTenantId);
+  if (!tenantId) return new Response("ok");
+
+  /****************************
+   * FEEDBACK
+   ****************************/
+  if (activity.value?.action === "feedback") {
+    await fetch(RAG_QUERY_URL.replace("/rag-query", "/feedback"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        "x-internal-token": INTERNAL_LOOKUP_SECRET,
+      },
+      body: JSON.stringify({
+        qa_log_id: activity.value.qa_log_id,
+        feedback: activity.value.feedback,
+        tenant_id: tenantId,
+        source: "teams",
+        teams_user_id: activity.from?.id ?? null,
+      }),
+    });
+
+    return new Response("ok");
+  }
+
+  if (!activity.text) return new Response("ok");
+
+  /****************************
+   * IMMEDIATE "WORKING ON IT"
+   ****************************/
+  const accessToken = await getBotAccessToken(aadTenantId, creds);
+
+  const placeholderRes = await fetch(
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation!.id,
     )}/activities`,
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${access_token}`,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
         type: "message",
-        attachments: [
-          {
-            contentType: "application/vnd.microsoft.card.adaptive",
-            content: {
-              type: "AdaptiveCard",
-              version: "1.4",
-              body: [
-                {
-                  type: "TextBlock",
-                  text: rag.answer ?? "No answer found.",
-                  wrap: true,
-                },
-              ],
-              actions,
-            },
-          },
-        ],
+        text: "⏳ Working on it…",
         replyToId: activity.replyToId ?? activity.id,
       }),
     },
   );
+
+  const { id: placeholderActivityId } = await placeholderRes.json();
+
+  /****************************
+   * ASYNC RAG
+   ****************************/
+  (async () => {
+    const ragRes = await fetch(RAG_QUERY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        "x-tenant-id": tenantId,
+      },
+      body: JSON.stringify({
+        question: activity.text!.trim(),
+        source: "teams",
+      }),
+    });
+
+    const rag = await ragRes.json();
+
+    const actions = rag.qa_log_id
+      ? [
+          {
+            type: "Action.Submit",
+            title: "👍 Helpful",
+            data: {
+              action: "feedback",
+              feedback: "up",
+              qa_log_id: rag.qa_log_id,
+            },
+          },
+          {
+            type: "Action.Submit",
+            title: "👎 Not helpful",
+            data: {
+              action: "feedback",
+              feedback: "down",
+              qa_log_id: rag.qa_log_id,
+            },
+          },
+        ]
+      : [];
+
+    await fetch(
+      `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
+        activity.conversation!.id,
+      )}/activities/${placeholderActivityId}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          type: "message",
+          attachments: [
+            {
+              contentType: "application/vnd.microsoft.card.adaptive",
+              content: {
+                type: "AdaptiveCard",
+                version: "1.4",
+                body: [
+                  {
+                    type: "TextBlock",
+                    text: rag.answer ?? "No answer found.",
+                    wrap: true,
+                  },
+                ],
+                actions,
+              },
+            },
+          ],
+        }),
+      },
+    );
+  })();
 
   return new Response("ok");
 }
@@ -301,7 +289,6 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  console.log("🔥 RAW REQUEST", req.method, new URL(req.url).pathname);
   if (new URL(req.url).pathname === "/teams") return handleTeams(req);
   return new Response("ok");
 });
