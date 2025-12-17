@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL CLEANED VERSION
+ * InnsynAI Teams Bridge – FULL WORKING VERSION
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -13,19 +13,7 @@ const {
   TEAMS_TENANT_LOOKUP_URL,
   RAG_QUERY_URL,
   SUPABASE_ANON_KEY,
-  SUPABASE_URL,
 } = Deno.env.toObject();
-
-if (
-  !INTERNAL_LOOKUP_SECRET ||
-  !TEAMS_TENANT_LOOKUP_URL ||
-  !RAG_QUERY_URL ||
-  !SUPABASE_ANON_KEY ||
-  !SUPABASE_URL
-) {
-  console.error("❌ Missing env vars");
-  Deno.exit(1);
-}
 
 /********************************************************************************************
  * BOTFRAMEWORK OPENID CONFIG
@@ -43,7 +31,7 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
 }
 
 /********************************************************************************************
- * TENANT RESOLUTION
+ * TENANT LOOKUP
  ********************************************************************************************/
 async function resolveByBotAppId(botAppId: string) {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
@@ -58,7 +46,7 @@ async function resolveByBotAppId(botAppId: string) {
   return res.ok ? res.json() : null;
 }
 
-async function resolveInnsynTenantId(aadTenantId: string) {
+async function resolveTenantId(aadTenantId: string) {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
@@ -74,9 +62,9 @@ async function resolveInnsynTenantId(aadTenantId: string) {
 }
 
 /********************************************************************************************
- * JWT VALIDATION
+ * JWT VERIFICATION
  ********************************************************************************************/
-async function verifyBotFrameworkJwt(authHeader: string) {
+async function verifyJwt(authHeader: string) {
   const token = authHeader.slice(7);
   const decoded = jose.decodeJwt(token);
   const botAppId = decoded.aud as string;
@@ -108,38 +96,91 @@ interface TeamsActivity {
   value?: any;
 }
 
-type RagResponse = {
-  answer?: string;
-  qa_log_id?: string;
-};
-
 /********************************************************************************************
- * RAG QUERY
+ * MAIN HANDLER
  ********************************************************************************************/
-async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
-  const res = await fetch(RAG_QUERY_URL, {
+async function handleTeams(req: Request): Promise<Response> {
+  if (req.method !== "POST") return new Response("ok");
+
+  // Safe parse
+  let activity: TeamsActivity;
+  try {
+    const raw = await req.text();
+    if (!raw) return new Response("ok");
+    activity = JSON.parse(raw);
+  } catch {
+    return new Response("ok");
+  }
+
+  console.log(
+    "📨 Activity:",
+    activity.type,
+    "| hasText:",
+    Boolean(activity.text),
+    "| hasValue:",
+    Boolean(activity.value),
+  );
+
+  // JWT guard
+  const auth = req.headers.get("Authorization");
+  if (!auth) return new Response("ok");
+
+  let creds;
+  try {
+    creds = await verifyJwt(auth);
+  } catch (err) {
+    console.error("❌ JWT failed", err);
+    return new Response("unauthorized", { status: 401 });
+  }
+
+  const aadTenantId =
+    activity.channelData?.tenant?.id || activity.conversation?.tenantId;
+  if (!aadTenantId) return new Response("ok");
+
+  const tenantId = await resolveTenantId(aadTenantId);
+  if (!tenantId) return new Response("ok");
+
+  /****************************
+   * FEEDBACK HANDLER
+   ****************************/
+  if (activity.value?.action === "feedback") {
+    console.log("👍 Feedback", activity.value);
+
+    await fetch(RAG_QUERY_URL.replace("/rag-query", "/feedback"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        "x-internal-token": INTERNAL_LOOKUP_SECRET,
+      },
+      body: JSON.stringify(activity.value),
+    });
+
+    return new Response("ok");
+  }
+
+  /****************************
+   * MESSAGE → RAG
+   ****************************/
+  if (!activity.text) return new Response("ok");
+
+  const ragRes = await fetch(RAG_QUERY_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       apikey: SUPABASE_ANON_KEY,
       "x-tenant-id": tenantId,
     },
-    body: JSON.stringify({ question: q, source: "teams" }),
+    body: JSON.stringify({ question: activity.text.trim(), source: "teams" }),
   });
 
-  if (!res.ok) throw new Error("RAG failed");
-  return res.json();
-}
+  const rag = await ragRes.json();
 
-/********************************************************************************************
- * SEND TEAMS REPLY
- ********************************************************************************************/
-async function sendTeamsReply(
-  activity: TeamsActivity,
-  card: any,
-  creds: any,
-  aadTenantId: string,
-) {
+  console.log("🧠 RAG response keys:", Object.keys(rag));
+
+  /****************************
+   * SEND MESSAGE + BUTTONS
+   ****************************/
   const tokenRes = await fetch(
     `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
@@ -171,75 +212,44 @@ async function sendTeamsReply(
         attachments: [
           {
             contentType: "application/vnd.microsoft.card.adaptive",
-            content: card,
+            content: {
+              type: "AdaptiveCard",
+              version: "1.4",
+              body: [
+                {
+                  type: "TextBlock",
+                  text: rag.answer ?? "No answer found.",
+                  wrap: true,
+                },
+              ],
+              actions: [
+                {
+                  type: "Action.Submit",
+                  title: "👍 Helpful",
+                  data: {
+                    action: "feedback",
+                    feedback: "up",
+                    tenant_id: tenantId,
+                    qa_log_id: rag.qa_log_id ?? null,
+                  },
+                },
+                {
+                  type: "Action.Submit",
+                  title: "👎 Not helpful",
+                  data: {
+                    action: "feedback",
+                    feedback: "down",
+                    tenant_id: tenantId,
+                    qa_log_id: rag.qa_log_id ?? null,
+                  },
+                },
+              ],
+            },
           },
         ],
         replyToId: activity.replyToId ?? activity.id,
       }),
     },
-  );
-}
-
-/********************************************************************************************
- * MAIN HANDLER
- ********************************************************************************************/
-async function handleTeams(req: Request): Promise<Response> {
-  if (req.method !== "POST") return new Response("ok");
-
-  // ---- Safe body parsing ----
-  let activity: TeamsActivity;
-  try {
-    const raw = await req.text();
-    if (!raw) return new Response("ok");
-    activity = JSON.parse(raw);
-  } catch {
-    return new Response("ok");
-  }
-
-  console.log(
-    "📨 Activity:",
-    activity.type,
-    "| auth:",
-    Boolean(req.headers.get("Authorization")),
-  );
-
-  // Ignore non-message noise
-  if (!activity.text && !activity.value) {
-    return new Response("ok");
-  }
-
-  // JWT guard
-  const auth = req.headers.get("Authorization");
-  if (!auth) {
-    return new Response("ok");
-  }
-
-  let creds;
-  try {
-    creds = await verifyBotFrameworkJwt(auth);
-  } catch (err) {
-    console.error("❌ JWT verification failed", err);
-    return new Response("unauthorized", { status: 401 });
-  }
-
-  const aadTenantId =
-    activity.channelData?.tenant?.id || activity.conversation?.tenantId;
-  if (!aadTenantId) return new Response("ok");
-
-  const tenantId = await resolveInnsynTenantId(aadTenantId);
-  if (!tenantId) return new Response("ok");
-
-  const rag = await callRagQuery(tenantId, activity.text.trim());
-
-  await sendTeamsReply(
-    activity,
-    {
-      type: "AdaptiveCard",
-      version: "1.4",
-      body: [{ type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true }],
-    },
-    creds,
-    aadTenantId,
   );
 
   return new Response("ok");
@@ -250,10 +260,6 @@ async function handleTeams(req: Request): Promise<Response> {
  ********************************************************************************************/
 serve(req => {
   console.log("🔥 RAW REQUEST", req.method, new URL(req.url).pathname);
-
-  if (new URL(req.url).pathname === "/teams") {
-    return handleTeams(req);
-  }
-
+  if (new URL(req.url).pathname === "/teams") return handleTeams(req);
   return new Response("ok");
 });
