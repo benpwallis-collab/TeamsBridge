@@ -1,5 +1,9 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (RAG + Feedback + Working-on-it update)
+ * InnsynAI Teams Bridge – FINAL, RENDER-SAFE
+ * - Immediate "Working on it…" reply
+ * - Inline RAG execution (no background async)
+ * - PATCH placeholder message with answer
+ * - Feedback preserved
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -107,7 +111,7 @@ interface TeamsActivity {
 }
 
 /********************************************************************************************
- * HELPERS
+ * BOT TOKEN
  ********************************************************************************************/
 async function getBotAccessToken(aadTenantId: string, creds: any) {
   const res = await fetch(
@@ -123,43 +127,72 @@ async function getBotAccessToken(aadTenantId: string, creds: any) {
       }),
     },
   );
-  return (await res.json()).access_token;
+
+  const json = await res.json();
+  if (!json.access_token) {
+    console.error("❌ Failed to get bot token", json);
+    throw new Error("Bot token failure");
+  }
+
+  return json.access_token;
 }
 
 /********************************************************************************************
  * MAIN HANDLER
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
+  console.log("🔥 Incoming Teams request");
+
   if (req.method !== "POST") return new Response("ok");
 
   let activity: TeamsActivity;
   try {
     activity = JSON.parse(await req.text());
   } catch {
+    console.warn("⚠️ Invalid JSON body");
     return new Response("ok");
   }
 
+  console.log(
+    "📨 Activity",
+    activity.type,
+    "| text:",
+    activity.text?.slice(0, 80),
+  );
+
   const auth = req.headers.get("Authorization");
-  if (!auth) return new Response("ok");
+  if (!auth) {
+    console.warn("⚠️ Missing Authorization header");
+    return new Response("ok");
+  }
 
   let creds;
   try {
     creds = await verifyJwt(auth);
-  } catch {
+  } catch (err) {
+    console.error("❌ JWT verification failed", err);
     return new Response("unauthorized", { status: 401 });
   }
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
-  if (!aadTenantId) return new Response("ok");
+  if (!aadTenantId) {
+    console.warn("⚠️ Missing AAD tenant id");
+    return new Response("ok");
+  }
 
   const tenantId = await resolveTenantId(aadTenantId);
-  if (!tenantId) return new Response("ok");
+  if (!tenantId) {
+    console.warn("⚠️ Tenant not found");
+    return new Response("ok");
+  }
 
   /****************************
    * FEEDBACK
    ****************************/
   if (activity.value?.action === "feedback") {
+    console.log("👍 Feedback received", activity.value);
+
     await fetch(RAG_QUERY_URL.replace("/rag-query", "/feedback"), {
       method: "POST",
       headers: {
@@ -182,7 +215,7 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!activity.text) return new Response("ok");
 
   /****************************
-   * IMMEDIATE "WORKING ON IT"
+   * SEND PLACEHOLDER
    ****************************/
   const accessToken = await getBotAccessToken(aadTenantId, creds);
 
@@ -204,83 +237,100 @@ async function handleTeams(req: Request): Promise<Response> {
     },
   );
 
-  const { id: placeholderActivityId } = await placeholderRes.json();
+  const placeholderJson = await placeholderRes.json();
+  const placeholderActivityId = placeholderJson.id;
+
+  console.log("🕒 Placeholder sent", placeholderActivityId);
 
   /****************************
-   * ASYNC RAG
+   * RAG QUERY (INLINE)
    ****************************/
-  (async () => {
-    const ragRes = await fetch(RAG_QUERY_URL, {
-      method: "POST",
+  const ragRes = await fetch(RAG_QUERY_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      "x-tenant-id": tenantId,
+    },
+    body: JSON.stringify({
+      question: activity.text.trim(),
+      source: "teams",
+    }),
+  });
+
+  if (!ragRes.ok) {
+    console.error("❌ RAG failed", await ragRes.text());
+    return new Response("ok");
+  }
+
+  const rag = await ragRes.json();
+  console.log("🧠 RAG completed", rag.qa_log_id);
+
+  /****************************
+   * BUILD ACTIONS
+   ****************************/
+  const actions = rag.qa_log_id
+    ? [
+        {
+          type: "Action.Submit",
+          title: "👍 Helpful",
+          data: { action: "feedback", feedback: "up", qa_log_id: rag.qa_log_id },
+        },
+        {
+          type: "Action.Submit",
+          title: "👎 Not helpful",
+          data: {
+            action: "feedback",
+            feedback: "down",
+            qa_log_id: rag.qa_log_id,
+          },
+        },
+      ]
+    : [];
+
+  /****************************
+   * PATCH PLACEHOLDER
+   ****************************/
+  const patchToken = await getBotAccessToken(aadTenantId, creds);
+
+  const patchRes = await fetch(
+    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
+      activity.conversation!.id,
+    )}/activities/${placeholderActivityId}`,
+    {
+      method: "PATCH",
       headers: {
+        Authorization: `Bearer ${patchToken}`,
         "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-        "x-tenant-id": tenantId,
       },
       body: JSON.stringify({
-        question: activity.text!.trim(),
-        source: "teams",
+        type: "message",
+        attachments: [
+          {
+            contentType: "application/vnd.microsoft.card.adaptive",
+            content: {
+              type: "AdaptiveCard",
+              version: "1.4",
+              body: [
+                {
+                  type: "TextBlock",
+                  text: rag.answer ?? "No answer found.",
+                  wrap: true,
+                },
+              ],
+              actions,
+            },
+          },
+        ],
       }),
-    });
+    },
+  );
 
-    const rag = await ragRes.json();
-
-    const actions = rag.qa_log_id
-      ? [
-          {
-            type: "Action.Submit",
-            title: "👍 Helpful",
-            data: {
-              action: "feedback",
-              feedback: "up",
-              qa_log_id: rag.qa_log_id,
-            },
-          },
-          {
-            type: "Action.Submit",
-            title: "👎 Not helpful",
-            data: {
-              action: "feedback",
-              feedback: "down",
-              qa_log_id: rag.qa_log_id,
-            },
-          },
-        ]
-      : [];
-
-    await fetch(
-      `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
-        activity.conversation!.id,
-      )}/activities/${placeholderActivityId}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          type: "message",
-          attachments: [
-            {
-              contentType: "application/vnd.microsoft.card.adaptive",
-              content: {
-                type: "AdaptiveCard",
-                version: "1.4",
-                body: [
-                  {
-                    type: "TextBlock",
-                    text: rag.answer ?? "No answer found.",
-                    wrap: true,
-                  },
-                ],
-                actions,
-              },
-            },
-          ],
-        }),
-      },
-    );
-  })();
+  if (!patchRes.ok) {
+    console.error("❌ PATCH failed", patchRes.status, await patchRes.text());
+  } else {
+    console.log("✅ Message updated");
+  }
 
   return new Response("ok");
 }
@@ -289,6 +339,7 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
+  console.log("➡️ Request", req.method, new URL(req.url).pathname);
   if (new URL(req.url).pathname === "/teams") return handleTeams(req);
   return new Response("ok");
 });
