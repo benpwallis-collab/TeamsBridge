@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FULL WORKING VERSION
+ * InnsynAI Teams Bridge – FINAL (RAG + Feedback, strict & correct)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -14,6 +14,16 @@ const {
   RAG_QUERY_URL,
   SUPABASE_ANON_KEY,
 } = Deno.env.toObject();
+
+if (
+  !INTERNAL_LOOKUP_SECRET ||
+  !TEAMS_TENANT_LOOKUP_URL ||
+  !RAG_QUERY_URL ||
+  !SUPABASE_ANON_KEY
+) {
+  console.error("❌ Missing env vars");
+  Deno.exit(1);
+}
 
 /********************************************************************************************
  * BOTFRAMEWORK OPENID CONFIG
@@ -102,7 +112,7 @@ interface TeamsActivity {
 async function handleTeams(req: Request): Promise<Response> {
   if (req.method !== "POST") return new Response("ok");
 
-  // Safe parse
+  // ---- Safe parse ----
   let activity: TeamsActivity;
   try {
     const raw = await req.text();
@@ -121,7 +131,7 @@ async function handleTeams(req: Request): Promise<Response> {
     Boolean(activity.value),
   );
 
-  // JWT guard
+  // ---- JWT guard ----
   const auth = req.headers.get("Authorization");
   if (!auth) return new Response("ok");
 
@@ -141,20 +151,38 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!tenantId) return new Response("ok");
 
   /****************************
-   * FEEDBACK HANDLER
+   * FEEDBACK PATH
    ****************************/
   if (activity.value?.action === "feedback") {
-    console.log("👍 Feedback", activity.value);
+    const payload = {
+      qa_log_id: activity.value.qa_log_id,
+      feedback: activity.value.feedback,
+      tenant_id: tenantId,
+      source: "teams",
+      teams_user_id: activity.value.teams_user_id ?? activity.from?.id ?? null,
+      comment: activity.value.comment ?? undefined,
+    };
 
-    await fetch(RAG_QUERY_URL.replace("/rag-query", "/feedback"), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-        "x-internal-token": INTERNAL_LOOKUP_SECRET,
+    console.log("➡️ Forwarding feedback", payload);
+
+    const res = await fetch(
+      RAG_QUERY_URL.replace("/rag-query", "/feedback"),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_ANON_KEY,
+          "x-internal-token": INTERNAL_LOOKUP_SECRET,
+        },
+        body: JSON.stringify(payload),
       },
-      body: JSON.stringify(activity.value),
-    });
+    );
+
+    if (!res.ok) {
+      console.error("❌ Feedback failed", res.status, await res.text());
+    } else {
+      console.log("✅ Feedback saved");
+    }
 
     return new Response("ok");
   }
@@ -171,15 +199,50 @@ async function handleTeams(req: Request): Promise<Response> {
       apikey: SUPABASE_ANON_KEY,
       "x-tenant-id": tenantId,
     },
-    body: JSON.stringify({ question: activity.text.trim(), source: "teams" }),
+    body: JSON.stringify({
+      question: activity.text.trim(),
+      source: "teams",
+    }),
   });
 
   const rag = await ragRes.json();
 
-  console.log("🧠 RAG response keys:", Object.keys(rag));
+  console.log("🧠 RAG qa_log_id:", rag.qa_log_id);
 
   /****************************
-   * SEND MESSAGE + BUTTONS
+   * BUILD ADAPTIVE CARD
+   ****************************/
+  const actions = rag.qa_log_id
+    ? [
+        {
+          type: "Action.Submit",
+          title: "👍 Helpful",
+          data: {
+            action: "feedback",
+            feedback: "up",
+            qa_log_id: rag.qa_log_id,
+            tenant_id: tenantId,
+            source: "teams",
+            teams_user_id: activity.from?.id ?? null,
+          },
+        },
+        {
+          type: "Action.Submit",
+          title: "👎 Not helpful",
+          data: {
+            action: "feedback",
+            feedback: "down",
+            qa_log_id: rag.qa_log_id,
+            tenant_id: tenantId,
+            source: "teams",
+            teams_user_id: activity.from?.id ?? null,
+          },
+        },
+      ]
+    : [];
+
+  /****************************
+   * SEND REPLY
    ****************************/
   const tokenRes = await fetch(
     `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
@@ -222,28 +285,7 @@ async function handleTeams(req: Request): Promise<Response> {
                   wrap: true,
                 },
               ],
-              actions: [
-                {
-                  type: "Action.Submit",
-                  title: "👍 Helpful",
-                  data: {
-                    action: "feedback",
-                    feedback: "up",
-                    tenant_id: tenantId,
-                    qa_log_id: rag.qa_log_id ?? null,
-                  },
-                },
-                {
-                  type: "Action.Submit",
-                  title: "👎 Not helpful",
-                  data: {
-                    action: "feedback",
-                    feedback: "down",
-                    tenant_id: tenantId,
-                    qa_log_id: rag.qa_log_id ?? null,
-                  },
-                },
-              ],
+              actions,
             },
           },
         ],
