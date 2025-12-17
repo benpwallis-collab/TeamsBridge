@@ -1,13 +1,12 @@
-console.log("🔥 RAW HIT", req.method, req.url);
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (Human Answer Capture safe + fire-and-forget)
+ * InnsynAI Teams Bridge – DEPLOY-SAFE + HARD LOGGING
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 
 /********************************************************************************************
- * ENV VARS (NO NEW ONES)
+ * ENV VARS
  ********************************************************************************************/
 const {
   INTERNAL_LOOKUP_SECRET,
@@ -119,7 +118,7 @@ type RagResponse = {
 };
 
 /********************************************************************************************
- * HUMAN ANSWER CAPTURE (STRICT FIRE-AND-FORGET)
+ * HUMAN ANSWER CAPTURE (FIRE-AND-FORGET)
  ********************************************************************************************/
 function fireHumanAnswerCapture(
   tenantId: string,
@@ -152,12 +151,8 @@ function fireHumanAnswerCapture(
           activity_id: activity.id,
         },
       }),
-    }).catch(() => {
-      // absolute no-op
-    });
-  } catch {
-    // absolute no-op
-  }
+    }).catch(() => {});
+  } catch {}
 }
 
 /********************************************************************************************
@@ -185,9 +180,7 @@ function buildAdaptiveCard(rag: RagResponse, tenantId: string, qaLogId?: string)
   return {
     type: "AdaptiveCard",
     version: "1.4",
-    body: [
-      { type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true },
-    ],
+    body: [{ type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true }],
     actions: qaLogId
       ? [
           {
@@ -253,6 +246,8 @@ async function sendTeamsReply(activity: TeamsActivity, card: any, creds: any, aa
  * MAIN HANDLER
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
+  console.log("🔥 TEAMS HIT", req.method, req.url);
+
   if (req.method !== "POST") return new Response("ok");
 
   const creds = await verifyBotFrameworkJwt(req.headers.get("Authorization"));
@@ -262,7 +257,6 @@ async function handleTeams(req: Request): Promise<Response> {
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  // Feedback passthrough
   if (activity.value?.action === "feedback") {
     await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
       method: "POST",
@@ -281,7 +275,6 @@ async function handleTeams(req: Request): Promise<Response> {
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) return new Response("no tenant");
 
-  // 🔥 capture (never awaited)
   fireHumanAnswerCapture(tenantId, aadTenantId, activity);
 
   const rag = await callRagQuery(tenantId, activity.text.trim());
@@ -295,6 +288,11 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  if (new URL(req.url).pathname === "/teams") return handleTeams(req);
+  console.log("🔥 RAW REQUEST", req.method, new URL(req.url).pathname);
+
+  if (new URL(req.url).pathname === "/teams") {
+    return handleTeams(req);
+  }
+
   return new Response("ok");
 });
