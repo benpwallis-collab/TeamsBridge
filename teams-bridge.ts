@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – DEPLOY-SAFE + HARD LOGGING
+ * InnsynAI Teams Bridge – CORRECTED (Teams activity-safe, JWT-guarded)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -74,11 +74,9 @@ async function resolveInnsynTenantId(aadTenantId: string) {
 }
 
 /********************************************************************************************
- * JWT VALIDATION
+ * JWT VALIDATION (GUARDED)
  ********************************************************************************************/
-async function verifyBotFrameworkJwt(authHeader: string | null) {
-  if (!authHeader?.startsWith("Bearer ")) throw new Error("Missing auth");
-
+async function verifyBotFrameworkJwt(authHeader: string) {
   const token = authHeader.slice(7);
   const decoded = jose.decodeJwt(token);
   const botAppId = decoded.aud as string;
@@ -99,6 +97,7 @@ async function verifyBotFrameworkJwt(authHeader: string | null) {
  * TYPES
  ********************************************************************************************/
 interface TeamsActivity {
+  type?: string;
   id?: string;
   text?: string;
   from?: { id?: string };
@@ -111,49 +110,8 @@ interface TeamsActivity {
 
 type RagResponse = {
   answer?: string;
-  confidence?: number;
-  reviewed?: boolean;
-  sources?: { title?: string; url?: string }[];
   qa_log_id?: string;
 };
-
-/********************************************************************************************
- * HUMAN ANSWER CAPTURE (FIRE-AND-FORGET)
- ********************************************************************************************/
-function fireHumanAnswerCapture(
-  tenantId: string,
-  aadTenantId: string,
-  activity: TeamsActivity,
-) {
-  try {
-    if (!activity.text || !activity.conversation?.id || !activity.id) return;
-
-    fetch(`${SUPABASE_URL}/functions/v1/capture-human-answers`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-      },
-      body: JSON.stringify({
-        tenant_id: tenantId,
-        source_type: "teams",
-        teams_tenant_id: aadTenantId,
-        thread_messages: [
-          {
-            user_id: activity.from?.id ?? "unknown",
-            text: activity.text,
-            timestamp: new Date().toISOString(),
-            is_bot: false,
-          },
-        ],
-        source_reference: {
-          conversation_id: activity.conversation.id,
-          activity_id: activity.id,
-        },
-      }),
-    }).catch(() => {});
-  } catch {}
-}
 
 /********************************************************************************************
  * RAG QUERY
@@ -174,34 +132,14 @@ async function callRagQuery(tenantId: string, q: string): Promise<RagResponse> {
 }
 
 /********************************************************************************************
- * ADAPTIVE CARD
- ********************************************************************************************/
-function buildAdaptiveCard(rag: RagResponse, tenantId: string, qaLogId?: string) {
-  return {
-    type: "AdaptiveCard",
-    version: "1.4",
-    body: [{ type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true }],
-    actions: qaLogId
-      ? [
-          {
-            type: "Action.Submit",
-            title: "👍 Helpful",
-            data: { action: "feedback", feedback: "up", tenant_id: tenantId, qa_log_id: qaLogId },
-          },
-          {
-            type: "Action.Submit",
-            title: "👎 Not helpful",
-            data: { action: "feedback", feedback: "down", tenant_id: tenantId, qa_log_id: qaLogId },
-          },
-        ]
-      : [],
-  };
-}
-
-/********************************************************************************************
  * SEND TEAMS REPLY
  ********************************************************************************************/
-async function sendTeamsReply(activity: TeamsActivity, card: any, creds: any, aadTenantId: string) {
+async function sendTeamsReply(
+  activity: TeamsActivity,
+  card: any,
+  creds: any,
+  aadTenantId: string,
+) {
   const tokenRes = await fetch(
     `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
@@ -250,37 +188,56 @@ async function handleTeams(req: Request): Promise<Response> {
 
   if (req.method !== "POST") return new Response("ok");
 
-  const creds = await verifyBotFrameworkJwt(req.headers.get("Authorization"));
   const activity = (await req.json()) as TeamsActivity;
+
+  console.log(
+    "📨 Activity:",
+    activity.type,
+    "| auth:",
+    Boolean(req.headers.get("Authorization")),
+  );
+
+  // Ignore non-message noise
+  if (!activity.text && !activity.value) {
+    return new Response("ok");
+  }
+
+  // JWT guard
+  const auth = req.headers.get("Authorization");
+  if (!auth) {
+    console.warn("⚠️ No auth header – ignoring activity");
+    return new Response("ok");
+  }
+
+  let creds;
+  try {
+    creds = await verifyBotFrameworkJwt(auth);
+    console.log("✅ JWT verified");
+  } catch (err) {
+    console.error("❌ JWT verification failed", err);
+    return new Response("unauthorized", { status: 401 });
+  }
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
   if (!aadTenantId) return new Response("bad request", { status: 400 });
 
-  if (activity.value?.action === "feedback") {
-    await fetch(`${RAG_QUERY_URL.replace("/rag-query", "/feedback")}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-        "x-internal-token": INTERNAL_LOOKUP_SECRET,
-      },
-      body: JSON.stringify(activity.value),
-    });
-    return new Response("ok");
-  }
-
-  if (!activity.text) return new Response("ignored");
-
   const tenantId = await resolveInnsynTenantId(aadTenantId);
   if (!tenantId) return new Response("no tenant");
 
-  fireHumanAnswerCapture(tenantId, aadTenantId, activity);
-
   const rag = await callRagQuery(tenantId, activity.text.trim());
-  const card = buildAdaptiveCard(rag, tenantId, rag.qa_log_id);
 
-  await sendTeamsReply(activity, card, creds, aadTenantId);
+  await sendTeamsReply(
+    activity,
+    {
+      type: "AdaptiveCard",
+      version: "1.4",
+      body: [{ type: "TextBlock", text: rag.answer ?? "No answer found.", wrap: true }],
+    },
+    creds,
+    aadTenantId,
+  );
+
   return new Response("ok");
 }
 
