@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – CORRECTED (Teams activity-safe, JWT-guarded)
+ * InnsynAI Teams Bridge – FINAL CLEANED VERSION
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -74,7 +74,7 @@ async function resolveInnsynTenantId(aadTenantId: string) {
 }
 
 /********************************************************************************************
- * JWT VALIDATION (GUARDED)
+ * JWT VALIDATION
  ********************************************************************************************/
 async function verifyBotFrameworkJwt(authHeader: string) {
   const token = authHeader.slice(7);
@@ -184,11 +184,17 @@ async function sendTeamsReply(
  * MAIN HANDLER
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
-  console.log("🔥 TEAMS HIT", req.method, req.url);
-
   if (req.method !== "POST") return new Response("ok");
 
-  const activity = (await req.json()) as TeamsActivity;
+  // ---- Safe body parsing ----
+  let activity: TeamsActivity;
+  try {
+    const raw = await req.text();
+    if (!raw) return new Response("ok");
+    activity = JSON.parse(raw);
+  } catch {
+    return new Response("ok");
+  }
 
   console.log(
     "📨 Activity:",
@@ -205,14 +211,12 @@ async function handleTeams(req: Request): Promise<Response> {
   // JWT guard
   const auth = req.headers.get("Authorization");
   if (!auth) {
-    console.warn("⚠️ No auth header – ignoring activity");
     return new Response("ok");
   }
 
   let creds;
   try {
     creds = await verifyBotFrameworkJwt(auth);
-    console.log("✅ JWT verified");
   } catch (err) {
     console.error("❌ JWT verification failed", err);
     return new Response("unauthorized", { status: 401 });
@@ -220,10 +224,10 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
-  if (!aadTenantId) return new Response("bad request", { status: 400 });
+  if (!aadTenantId) return new Response("ok");
 
   const tenantId = await resolveInnsynTenantId(aadTenantId);
-  if (!tenantId) return new Response("no tenant");
+  if (!tenantId) return new Response("ok");
 
   const rag = await callRagQuery(tenantId, activity.text.trim());
 
