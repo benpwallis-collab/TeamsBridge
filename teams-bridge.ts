@@ -2,7 +2,7 @@
  * InnsynAI Teams Bridge – FINAL, RENDER-SAFE
  * - Immediate "Working on it…" reply
  * - Inline RAG execution (no background async)
- * - PATCH placeholder message with answer
+ * - PUT placeholder message with answer
  * - Feedback preserved
  ********************************************************************************************/
 
@@ -289,7 +289,7 @@ async function handleTeams(req: Request): Promise<Response> {
     : [];
 
   /****************************
-   * PATCH PLACEHOLDER
+   * PUT PLACEHOLDER
    ****************************/
   const patchToken = await getBotAccessToken(aadTenantId, creds);
 
@@ -298,7 +298,7 @@ async function handleTeams(req: Request): Promise<Response> {
       activity.conversation!.id,
     )}/activities/${placeholderActivityId}`,
     {
-      method: "PATCH",
+      method: "PUT",
       headers: {
         Authorization: `Bearer ${patchToken}`,
         "Content-Type": "application/json",
