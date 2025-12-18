@@ -4,6 +4,7 @@
  * - Inline RAG execution (no background async)
  * - PUT placeholder message with answer
  * - Feedback preserved
+ * - Source citations with platform labels
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -42,6 +43,58 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
   const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
   jwks = await fetch(meta.jwks_uri).then(r => r.json());
   return jwks!;
+}
+
+/********************************************************************************************
+ * HELPER FUNCTIONS
+ ********************************************************************************************/
+function getPlatformLabel(source: string): string {
+  const labels: Record<string, string> = {
+    notion: 'Notion',
+    confluence: 'Confluence',
+    gitlab: 'GitLab',
+    google_drive: 'Google Drive',
+    sharepoint: 'SharePoint',
+    manual: 'Manual Upload',
+    slack: 'Slack',
+    teams: 'Teams',
+  };
+  return labels[source] || source || 'Unknown';
+}
+
+function getRelativeDate(dateStr: string): string {
+  if (!dateStr) return 'recently';
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffHours / 24);
+  
+  if (diffHours < 1) return 'just now';
+  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+  if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+  return date.toLocaleDateString();
+}
+
+function formatSourcesForCard(sources: any[]): any[] {
+  if (!sources?.length) return [];
+  
+  return [
+    {
+      type: "TextBlock",
+      text: "**Sources:**",
+      wrap: true,
+      spacing: "Medium",
+    },
+    ...sources.map((s) => ({
+      type: "TextBlock",
+      text: s.url 
+        ? `• [${s.title}](${s.url}) — ${getPlatformLabel(s.source)} (Updated ${getRelativeDate(s.updated_at)})`
+        : `• ${s.title} — ${getPlatformLabel(s.source)} (Updated ${getRelativeDate(s.updated_at)})`,
+      wrap: true,
+      spacing: "Small",
+    })),
+  ];
 }
 
 /********************************************************************************************
@@ -264,7 +317,7 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   const rag = await ragRes.json();
-  console.log("🧠 RAG completed", rag.qa_log_id);
+  console.log("🧠 RAG completed", rag.qa_log_id, "| sources:", rag.sources?.length ?? 0);
 
   /****************************
    * BUILD ACTIONS
@@ -289,6 +342,18 @@ async function handleTeams(req: Request): Promise<Response> {
     : [];
 
   /****************************
+   * BUILD CARD BODY WITH SOURCES
+   ****************************/
+  const cardBody = [
+    {
+      type: "TextBlock",
+      text: rag.answer ?? "No answer found.",
+      wrap: true,
+    },
+    ...formatSourcesForCard(rag.sources),
+  ];
+
+  /****************************
    * PUT PLACEHOLDER
    ****************************/
   const patchToken = await getBotAccessToken(aadTenantId, creds);
@@ -311,13 +376,7 @@ async function handleTeams(req: Request): Promise<Response> {
             content: {
               type: "AdaptiveCard",
               version: "1.4",
-              body: [
-                {
-                  type: "TextBlock",
-                  text: rag.answer ?? "No answer found.",
-                  wrap: true,
-                },
-              ],
+              body: cardBody,
               actions,
             },
           },
@@ -329,7 +388,7 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!patchRes.ok) {
     console.error("❌ PATCH failed", patchRes.status, await patchRes.text());
   } else {
-    console.log("✅ Message updated");
+    console.log("✅ Message updated with sources");
   }
 
   return new Response("ok");
