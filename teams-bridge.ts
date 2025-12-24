@@ -1,5 +1,14 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – BASELINE WORKING VERSION (DEPLOYABLE)
+ * InnsynAI Teams Bridge – BASELINE (MATCHES WORKING TOKEN FLOW)
+ *
+ * PURPOSE:
+ * - Prove Teams → Bot → Teams roundtrip works
+ * - No PATCH
+ * - No RAG
+ * - No Adaptive Cards
+ *
+ * Key change vs your failing baseline:
+ * - Mint bot token from customer tenant authority (WORKED in your per-tenant bot version)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -90,21 +99,19 @@ async function resolveTenant(aadTenantId: string): Promise<string | null> {
 }
 
 /********************************************************************************************
- * BOT TOKEN (GLOBAL BOTFRAMEWORK AUTHORITY)
+ * BOT TOKEN (CUSTOMER TENANT AUTHORITY — this matches your working version)
  ********************************************************************************************/
-async function getBotToken(): Promise<string> {
+async function getBotToken(aadTenantId: string): Promise<string> {
   console.log("🔑 Minting bot token", {
-    authority: "botframework.com",
+    authority: aadTenantId,
     client_id: TEAMS_BOT_APP_ID,
   });
 
   const res = await fetch(
-    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "client_credentials",
         client_id: TEAMS_BOT_APP_ID,
@@ -151,6 +158,8 @@ async function handleTeams(req: Request): Promise<Response> {
     conversationType: activity.conversation?.conversationType,
     serviceUrl: activity.serviceUrl,
     conversationId: activity.conversation?.id,
+    activityId: activity.id,
+    replyToId: activity.replyToId,
     text: activity.text,
   });
 
@@ -161,11 +170,12 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const tenantId = await resolveTenant(aadTenantId);
   console.log("🧭 Tenant resolved", tenantId);
-
   if (!tenantId) return new Response("ok");
 
-  const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
-  const token = await getBotToken();
+  // Preserve exact serviceUrl, but avoid double slashes
+  const serviceUrl = String(activity.serviceUrl).replace(/\/$/, "");
+
+  const token = await getBotToken(aadTenantId);
 
   const postUrl =
     serviceUrl +
@@ -182,18 +192,20 @@ async function handleTeams(req: Request): Promise<Response> {
     body: JSON.stringify({
       type: "message",
       text: "Hello from InnsynAI 👋",
-      from: activity.recipient,
-      recipient: activity.from,
-      conversation: {
-        id: activity.conversation.id,
-      },
+      // This mirrors the version that worked
+      replyToId: activity.replyToId ?? activity.id,
     }),
   });
 
+  const bodyText = await res.text();
   if (!res.ok) {
-    console.error("❌ Teams send failed", res.status, await res.text());
+    console.error("❌ Teams send failed", res.status, bodyText);
+
+    // Helpful: many times the real clue is in WWW-Authenticate
+    const wwwAuth = res.headers.get("www-authenticate");
+    if (wwwAuth) console.error("🔎 WWW-Authenticate:", wwwAuth);
   } else {
-    console.log("✅ Message sent to Teams");
+    console.log("✅ Message sent to Teams", bodyText);
   }
 
   return new Response("ok");
