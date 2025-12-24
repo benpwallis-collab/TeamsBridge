@@ -1,8 +1,11 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS MODE)
+ * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS SAFE)
  *
- * CRITICAL FIX:
- *   ✅ Rewrites serviceUrl to *.ng.msg.teams.microsoft.com (required for replies)
+ * ✔ Single global bot identity
+ * ✔ Multi-tenant routing via AAD tenant id
+ * ✔ Auto-provision tenant mapping
+ * ✔ Uses EXACT serviceUrl from Teams (CRITICAL)
+ * ✔ botframework.com token authority
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -45,28 +48,6 @@ async function getJwks() {
   const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
   jwks = await fetch(meta.jwks_uri).then(r => r.json());
   return jwks!;
-}
-
-/********************************************************************************************
- * 🔥 CRITICAL FIX: map serviceUrl → ng.msg.teams.microsoft.com
- ********************************************************************************************/
-function normalizeServiceUrl(serviceUrl: string): string {
-  // Examples:
-  // https://smba.trafficmanager.net/emea/{tenantId}/
-  // → https://emea.ng.msg.teams.microsoft.com
-
-  if (serviceUrl.includes("/emea/")) {
-    return "https://emea.ng.msg.teams.microsoft.com";
-  }
-  if (serviceUrl.includes("/amer/")) {
-    return "https://amer.ng.msg.teams.microsoft.com";
-  }
-  if (serviceUrl.includes("/apac/")) {
-    return "https://apac.ng.msg.teams.microsoft.com";
-  }
-
-  // Safe fallback (EU)
-  return "https://emea.ng.msg.teams.microsoft.com";
 }
 
 /********************************************************************************************
@@ -174,6 +155,7 @@ async function handleTeams(req: Request): Promise<Response> {
     botAppId: TEAMS_BOT_APP_ID,
     aadTenantId,
     serviceUrl: activity.serviceUrl,
+    conversationId: activity.conversation?.id,
   });
 
   if (!aadTenantId || !activity.serviceUrl || !activity.conversation?.id) {
@@ -183,10 +165,11 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const tenantId = await resolveTenant(aadTenantId);
   console.log("🧭 Tenant resolved", tenantId);
+
   if (!tenantId) return new Response("ok");
 
-  const serviceUrl = normalizeServiceUrl(activity.serviceUrl);
-  console.log("🌐 Service URL rewritten", serviceUrl);
+  // ✅ CRITICAL: use serviceUrl EXACTLY as provided (only trim trailing slash)
+  const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
 
   const token = await getBotToken();
 
@@ -221,7 +204,6 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const placeholder = await placeholderRes.json().catch(() => ({}));
   const activityId = placeholder?.id;
-  if (!activityId) return new Response("ok");
 
   /****************************
    * RAG QUERY
@@ -240,7 +222,7 @@ async function handleTeams(req: Request): Promise<Response> {
   });
 
   const rag = await ragRes.json().catch(() => null);
-  if (!rag) return new Response("ok");
+  if (!activityId || !rag) return new Response("ok");
 
   /****************************
    * PATCH FINAL MESSAGE
