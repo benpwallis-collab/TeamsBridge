@@ -108,12 +108,7 @@ function getRelativeDate(dateStr: string): string {
 function formatSourcesForCard(sources: any[]): any[] {
   if (!sources?.length) return [];
   return [
-    {
-      type: "TextBlock",
-      text: "**Sources:**",
-      wrap: true,
-      spacing: "Medium",
-    },
+    { type: "TextBlock", text: "**Sources:**", wrap: true, spacing: "Medium" },
     ...sources.map((s) => ({
       type: "TextBlock",
       text: s.url
@@ -128,9 +123,7 @@ function formatSourcesForCard(sources: any[]): any[] {
 /********************************************************************************************
  * TENANT LOOKUP (AUTO-PROVISION)
  ********************************************************************************************/
-async function resolveOrCreateTenantId(
-  aadTenantId: string,
-): Promise<string | null> {
+async function resolveOrCreateTenantId(aadTenantId: string): Promise<string | null> {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
@@ -138,18 +131,11 @@ async function resolveOrCreateTenantId(
       apikey: SUPABASE_ANON_KEY,
       "x-internal-token": INTERNAL_LOOKUP_SECRET,
     },
-    body: JSON.stringify({
-      teams_tenant_id: aadTenantId,
-      auto_provision: true,
-    }),
+    body: JSON.stringify({ teams_tenant_id: aadTenantId, auto_provision: true }),
   });
 
   if (!res.ok) {
-    console.error(
-      "❌ teams-tenant-lookup failed",
-      res.status,
-      await res.text().catch(() => ""),
-    );
+    console.error("❌ teams-tenant-lookup failed", res.status, await res.text().catch(() => ""));
     return null;
   }
 
@@ -162,7 +148,6 @@ async function resolveOrCreateTenantId(
  ********************************************************************************************/
 async function verifyJwt(authHeader: string) {
   const token = authHeader.slice(7);
-
   const keyStore = jose.createLocalJWKSet(await getJwks());
   await jose.jwtVerify(token, keyStore, {
     issuer: "https://api.botframework.com",
@@ -171,11 +156,15 @@ async function verifyJwt(authHeader: string) {
 }
 
 /********************************************************************************************
- * BOT TOKEN (SINGLE BOT, TENANT-SPECIFIC ISSUER)
+ * BOT TOKEN (✅ BOTFRAMEWORK AUTHORITY — REQUIRED FOR TEAMS SEND)
+ *
+ * IMPORTANT:
+ * Outbound calls to {serviceUrl}/v3/... require a token minted from botframework.com authority,
+ * not the customer tenant authority. Using the tenant authority results in 401 from serviceUrl.
  ********************************************************************************************/
-async function getBotAccessToken(aadTenantId: string) {
+async function getBotAccessToken(): Promise<string> {
   const res = await fetch(
-    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
+    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -190,7 +179,7 @@ async function getBotAccessToken(aadTenantId: string) {
 
   const json = await res.json().catch(() => ({}));
   if (!json.access_token) {
-    console.error("❌ Failed to get bot token", json);
+    console.error("❌ Failed to get botframework token", json);
     throw new Error("Bot token failure");
   }
 
@@ -219,7 +208,7 @@ async function sendActivity(
   activity: TeamsActivity,
   accessToken: string,
   payload: any,
-): Promise<{ ok: boolean; id: string | null; status: number; bodyText: string }> {
+): Promise<{ ok: boolean; id: string | null; status: number }> {
   const url =
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation!.id,
@@ -237,7 +226,7 @@ async function sendActivity(
   const contentType = res.headers.get("content-type") || "";
   let id: string | null = null;
 
-  // Teams sometimes returns 200 with JSON { id }, or 204 with no content
+  // Teams may return 200 with JSON { id }, or 204 with no content
   if (contentType.includes("application/json")) {
     try {
       const json = await res.json();
@@ -246,7 +235,7 @@ async function sendActivity(
       id = null;
     }
   } else {
-    // best-effort to read text for debugging
+    // consume body best-effort (sometimes empty)
     try {
       await res.text();
     } catch {
@@ -254,15 +243,7 @@ async function sendActivity(
     }
   }
 
-  let bodyText = "";
-  try {
-    // Try to read (may be empty / already consumed). Safe best-effort.
-    bodyText = "";
-  } catch {
-    bodyText = "";
-  }
-
-  return { ok: res.ok, id, status: res.status, bodyText };
+  return { ok: res.ok, id, status: res.status };
 }
 
 async function putActivity(
@@ -292,20 +273,8 @@ async function putActivity(
 function buildCardPayload(rag: any) {
   const actions = rag?.qa_log_id
     ? [
-        {
-          type: "Action.Submit",
-          title: "👍 Helpful",
-          data: { action: "feedback", feedback: "up", qa_log_id: rag.qa_log_id },
-        },
-        {
-          type: "Action.Submit",
-          title: "👎 Not helpful",
-          data: {
-            action: "feedback",
-            feedback: "down",
-            qa_log_id: rag.qa_log_id,
-          },
-        },
+        { type: "Action.Submit", title: "👍 Helpful", data: { action: "feedback", feedback: "up", qa_log_id: rag.qa_log_id } },
+        { type: "Action.Submit", title: "👎 Not helpful", data: { action: "feedback", feedback: "down", qa_log_id: rag.qa_log_id } },
       ]
     : [];
 
@@ -315,11 +284,7 @@ function buildCardPayload(rag: any) {
   }
 
   const cardBody = [
-    {
-      type: "TextBlock",
-      text: answerText,
-      wrap: true,
-    },
+    { type: "TextBlock", text: answerText, wrap: true },
     ...formatSourcesForCard(rag?.sources ?? []),
   ];
 
@@ -371,20 +336,14 @@ async function handleTeams(req: Request): Promise<Response> {
 
   console.log(
     "📨 Activity",
-    "botAppId=",
-    TEAMS_BOT_APP_ID,
-    "aadTenantId=",
-    aadTenantId ?? "missing",
-    "conversationId=",
-    activity.conversation?.id ?? "missing",
-    "activityId=",
-    activity.id ?? "missing",
-    "from=",
-    activity.from?.id ?? "missing",
-    "type=",
-    activity.type ?? "missing",
-    "text=",
-    activity.text ? safeStr(activity.text, 80) : "none",
+    "botAppId=", TEAMS_BOT_APP_ID,
+    "aadTenantId=", aadTenantId ?? "missing",
+    "conversationId=", activity.conversation?.id ?? "missing",
+    "activityId=", activity.id ?? "missing",
+    "from=", activity.from?.id ?? "missing",
+    "type=", activity.type ?? "missing",
+    "text=", activity.text ? safeStr(activity.text, 80) : "none",
+    "serviceUrl=", activity.serviceUrl ?? "missing",
   );
 
   if (!activity.serviceUrl || !activity.conversation?.id) {
@@ -398,19 +357,10 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   const tenantId = await resolveOrCreateTenantId(aadTenantId);
-  console.log(
-    "🧭 Tenant resolved",
-    "aadTenantId=",
-    aadTenantId,
-    "-> tenantId=",
-    tenantId ?? "NOT_FOUND",
-  );
+  console.log("🧭 Tenant resolved", "aadTenantId=", aadTenantId, "-> tenantId=", tenantId ?? "NOT_FOUND");
 
   if (!tenantId) {
-    console.error(
-      "❌ Unable to resolve or create tenant for AAD tenant:",
-      aadTenantId,
-    );
+    console.error("❌ Unable to resolve or create tenant for AAD tenant:", aadTenantId);
     return new Response("ok");
   }
 
@@ -440,11 +390,7 @@ async function handleTeams(req: Request): Promise<Response> {
     );
 
     if (!feedbackRes.ok) {
-      console.error(
-        "❌ Feedback forward failed",
-        feedbackRes.status,
-        await feedbackRes.text().catch(() => ""),
-      );
+      console.error("❌ Feedback forward failed", feedbackRes.status, await feedbackRes.text().catch(() => ""));
     }
 
     return new Response("ok");
@@ -453,11 +399,11 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!activity.text?.trim()) return new Response("ok");
 
   /****************************
-   * GET BOT TOKEN
+   * GET BOT TOKEN (BOTFRAMEWORK AUTHORITY)
    ****************************/
   let token: string;
   try {
-    token = await getBotAccessToken(aadTenantId);
+    token = await getBotAccessToken();
   } catch (e) {
     console.error("❌ Bot token failure (cannot respond)", e);
     return new Response("ok");
@@ -475,10 +421,8 @@ async function handleTeams(req: Request): Promise<Response> {
   const placeholderRes = await sendActivity(activity, token, placeholderPayload);
   console.log(
     "🕒 Placeholder sent",
-    "status=",
-    placeholderRes.status,
-    "placeholderActivityId=",
-    placeholderRes.id ?? "none",
+    "status=", placeholderRes.status,
+    "placeholderActivityId=", placeholderRes.id ?? "none",
   );
 
   /****************************
@@ -498,23 +442,16 @@ async function handleTeams(req: Request): Promise<Response> {
   });
 
   if (!ragRes.ok) {
-    console.error(
-      "❌ RAG failed",
-      ragRes.status,
-      await ragRes.text().catch(() => ""),
-    );
+    console.error("❌ RAG failed", ragRes.status, await ragRes.text().catch(() => ""));
     return new Response("ok");
   }
 
   const rag = await ragRes.json().catch(() => null);
   console.log(
     "🧠 RAG completed",
-    "tenantId=",
-    tenantId,
-    "qa_log_id=",
-    rag?.qa_log_id ?? "none",
-    "sources=",
-    rag?.sources?.length ?? 0,
+    "tenantId=", tenantId,
+    "qa_log_id=", rag?.qa_log_id ?? "none",
+    "sources=", rag?.sources?.length ?? 0,
   );
 
   const finalCardPayload = buildCardPayload(rag);
@@ -523,15 +460,10 @@ async function handleTeams(req: Request): Promise<Response> {
    * PATCH IF WE HAVE ID, ELSE POST FINAL MESSAGE
    ****************************/
   // Re-mint token for final send (safe)
-  const patchToken = await getBotAccessToken(aadTenantId);
+  const patchToken = await getBotAccessToken();
 
   if (placeholderRes.id) {
-    const putRes = await putActivity(
-      activity,
-      patchToken,
-      placeholderRes.id,
-      finalCardPayload,
-    );
+    const putRes = await putActivity(activity, patchToken, placeholderRes.id, finalCardPayload);
 
     if (!putRes.ok) {
       console.error("❌ PUT failed; falling back to POST", putRes.status, putRes.text);
