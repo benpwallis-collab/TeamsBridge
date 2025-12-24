@@ -1,13 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – BASELINE WORKING VERSION (FIXED)
- *
- * PURPOSE:
- * - Prove Teams → Bot → Teams roundtrip works
- * - No PATCH
- * - No RAG
- * - No Adaptive Cards
- *
- * This MUST reply with a message in Teams.
+ * InnsynAI Teams Bridge – BASELINE WORKING VERSION (FIXED FOR PERSONAL CHAT)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -98,7 +90,7 @@ async function resolveTenant(aadTenantId: string): Promise<string | null> {
 }
 
 /********************************************************************************************
- * BOT TOKEN (GLOBAL BOTFRAMEWORK AUTHORITY — REQUIRED)
+ * BOT TOKEN (GLOBAL BOTFRAMEWORK AUTHORITY)
  ********************************************************************************************/
 async function getBotToken(): Promise<string> {
   console.log("🔑 Minting bot token", {
@@ -156,6 +148,7 @@ async function handleTeams(req: Request): Promise<Response> {
 
   console.log("📨 Activity received", {
     aadTenantId,
+    conversationType: activity.conversation?.conversationType,
     serviceUrl: activity.serviceUrl,
     conversationId: activity.conversation?.id,
     text: activity.text,
@@ -189,7 +182,6 @@ async function handleTeams(req: Request): Promise<Response> {
     body: JSON.stringify({
       type: "message",
       text: "Hello from InnsynAI 👋",
-      replyToId: activity.id,
     }),
   });
 
