@@ -1,5 +1,5 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – BASELINE WORKING VERSION
+ * InnsynAI Teams Bridge – BASELINE WORKING VERSION (FIXED)
  *
  * PURPOSE:
  * - Prove Teams → Bot → Teams roundtrip works
@@ -51,7 +51,7 @@ async function getJwks() {
 }
 
 /********************************************************************************************
- * JWT VERIFY
+ * JWT VERIFY (INBOUND)
  ********************************************************************************************/
 async function verifyJwt(authHeader: string) {
   const token = authHeader.slice(7);
@@ -98,16 +98,16 @@ async function resolveTenant(aadTenantId: string): Promise<string | null> {
 }
 
 /********************************************************************************************
- * BOT TOKEN (TENANT-SPECIFIC AUTHORITY — REQUIRED)
+ * BOT TOKEN (GLOBAL BOTFRAMEWORK AUTHORITY — REQUIRED)
  ********************************************************************************************/
-async function getBotToken(aadTenantId: string): Promise<string> {
+async function getBotToken(): Promise<string> {
   console.log("🔑 Minting bot token", {
-    authority: aadTenantId,
+    authority: "botframework.com",
     client_id: TEAMS_BOT_APP_ID,
   });
 
   const res = await fetch(
-    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
+    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
     {
       method: "POST",
       headers: {
@@ -172,7 +172,7 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!tenantId) return new Response("ok");
 
   const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
-  const token = await getBotToken(aadTenantId);
+  const token = await getBotToken();
 
   const postUrl =
     serviceUrl +
