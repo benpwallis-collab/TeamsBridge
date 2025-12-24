@@ -1,21 +1,15 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS MODE)
  *
- * CRITICAL FIX:
- *   ✅ Bot access tokens are minted against botframework.com
- *      NOT customer tenant IDs
- *
- * This resolves:
- *   - 401 "Authorization has been denied"
- *   - Missing service principal errors
- *   - Placeholder + PATCH failures
+ * FIX INCLUDED:
+ *   ✅ Normalizes serviceUrl (CRITICAL for EU tenants)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 
 /********************************************************************************************
- * ENV VARS
+ * ENV
  ********************************************************************************************/
 const {
   INTERNAL_LOOKUP_SECRET,
@@ -55,28 +49,17 @@ async function getJwks() {
 }
 
 /********************************************************************************************
- * HELPERS
+ * 🔥 CRITICAL FIX: normalize serviceUrl
  ********************************************************************************************/
-const log = (...args: any[]) => console.log(...args);
-
-function formatSourcesForCard(sources: any[]) {
-  if (!sources?.length) return [];
-  return [
-    { type: "TextBlock", text: "**Sources:**", wrap: true },
-    ...sources.map(s => ({
-      type: "TextBlock",
-      wrap: true,
-      text: s.url
-        ? `• [${s.title}](${s.url})`
-        : `• ${s.title}`,
-    })),
-  ];
+function normalizeServiceUrl(url: string): string {
+  // Removes trailing tenant id: /emea/{tenant-guid}/ → /emea/
+  return url.replace(/\/[0-9a-fA-F-]{36}\/?$/, "/");
 }
 
 /********************************************************************************************
  * TENANT LOOKUP (AUTO-PROVISION)
  ********************************************************************************************/
-async function resolveTenantId(aadTenantId: string): Promise<string | null> {
+async function resolveTenant(aadTenantId: string): Promise<string | null> {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
@@ -91,7 +74,7 @@ async function resolveTenantId(aadTenantId: string): Promise<string | null> {
   });
 
   if (!res.ok) {
-    log("❌ tenant lookup failed", res.status);
+    console.error("❌ tenant lookup failed", await res.text());
     return null;
   }
 
@@ -100,13 +83,13 @@ async function resolveTenantId(aadTenantId: string): Promise<string | null> {
 }
 
 /********************************************************************************************
- * JWT VERIFY (BOTFRAMEWORK → YOUR BOT)
+ * JWT VERIFY
  ********************************************************************************************/
 async function verifyJwt(authHeader: string) {
   const token = authHeader.slice(7);
   const decoded = jose.decodeJwt(token);
 
-  log("🔐 Incoming JWT", {
+  console.log("🔐 Incoming JWT", {
     aud: decoded.aud,
     iss: decoded.iss,
     tid: decoded.tid,
@@ -121,11 +104,10 @@ async function verifyJwt(authHeader: string) {
 }
 
 /********************************************************************************************
- * 🔑 BOT TOKEN (CRITICAL FIX)
- * MUST USE botframework.com
+ * BOT TOKEN (GLOBAL BOT, BOTFRAMEWORK AUTHORITY)
  ********************************************************************************************/
-async function getBotAccessToken() {
-  log("🔑 Minting bot token", {
+async function getBotToken() {
+  console.log("🔑 Minting bot token", {
     tenant: "botframework.com",
     client_id: TEAMS_BOT_APP_ID,
   });
@@ -146,12 +128,12 @@ async function getBotAccessToken() {
 
   const json = await res.json();
   if (!json.access_token) {
-    log("❌ Token mint failed", json);
-    throw new Error("Bot token failure");
+    console.error("❌ Token mint failed", json);
+    throw new Error("bot token failure");
   }
 
-  log("✅ Bot token minted");
-  return json.access_token as string;
+  console.log("✅ Bot token minted");
+  return json.access_token;
 }
 
 /********************************************************************************************
@@ -160,37 +142,53 @@ async function getBotAccessToken() {
 async function handleTeams(req: Request): Promise<Response> {
   if (req.method !== "POST") return new Response("ok");
 
-  const activity = await req.json();
-  const auth = req.headers.get("Authorization");
+  const body = await req.text();
+  let activity: any;
 
-  if (!auth?.startsWith("Bearer ")) {
-    log("⚠️ Missing auth header");
+  try {
+    activity = JSON.parse(body);
+  } catch {
     return new Response("ok");
   }
+
+  const auth = req.headers.get("Authorization");
+  if (!auth?.startsWith("Bearer ")) return new Response("ok");
 
   await verifyJwt(auth);
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
 
-  log("📨 Activity received", {
+  console.log("📨 Activity received", {
     botAppId: TEAMS_BOT_APP_ID,
     aadTenantId,
     serviceUrl: activity.serviceUrl,
   });
 
-  const tenantId = await resolveTenantId(aadTenantId);
-  log("🧭 Tenant resolved", tenantId);
+  if (!aadTenantId || !activity.serviceUrl || !activity.conversation?.id) {
+    console.warn("⚠️ Missing required activity fields");
+    return new Response("ok");
+  }
+
+  const tenantId = await resolveTenant(aadTenantId);
+  console.log("🧭 Tenant resolved", tenantId);
 
   if (!tenantId) return new Response("ok");
 
-  const token = await getBotAccessToken();
+  const serviceUrl = normalizeServiceUrl(activity.serviceUrl);
+
+  console.log("🌐 Service URL normalized", {
+    original: activity.serviceUrl,
+    normalized: serviceUrl,
+  });
+
+  const token = await getBotToken();
 
   /****************************
-   * PLACEHOLDER
+   * SEND PLACEHOLDER
    ****************************/
   const postUrl =
-    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
+    `${serviceUrl}v3/conversations/${encodeURIComponent(
       activity.conversation.id,
     )}/activities`;
 
@@ -207,14 +205,19 @@ async function handleTeams(req: Request): Promise<Response> {
     }),
   });
 
-  let placeholderId: string | null = null;
-  try {
-    const json = await placeholderRes.json();
-    placeholderId = json?.id ?? null;
-  } catch {}
+  if (!placeholderRes.ok) {
+    console.error("❌ TEAMS API ERROR", {
+      status: placeholderRes.status,
+      body: await placeholderRes.text(),
+    });
+    return new Response("ok");
+  }
+
+  const placeholder = await placeholderRes.json().catch(() => ({}));
+  const activityId = placeholder?.id;
 
   /****************************
-   * RAG
+   * RAG QUERY
    ****************************/
   const ragRes = await fetch(RAG_QUERY_URL, {
     method: "POST",
@@ -229,47 +232,29 @@ async function handleTeams(req: Request): Promise<Response> {
     }),
   });
 
-  const rag = await ragRes.json();
+  const rag = await ragRes.json().catch(() => null);
 
-  const card = {
-    type: "message",
-    attachments: [
-      {
-        contentType: "application/vnd.microsoft.card.adaptive",
-        content: {
-          type: "AdaptiveCard",
-          version: "1.4",
-          body: [
-            { type: "TextBlock", wrap: true, text: rag.answer },
-            ...formatSourcesForCard(rag.sources),
-          ],
-        },
-      },
-    ],
-  };
+  if (!activityId || !rag) return new Response("ok");
 
   /****************************
-   * PATCH OR FALLBACK POST
+   * PATCH FINAL MESSAGE
    ****************************/
-  if (placeholderId) {
-    await fetch(`${postUrl}/${placeholderId}`, {
+  await fetch(
+    `${serviceUrl}v3/conversations/${encodeURIComponent(
+      activity.conversation.id,
+    )}/activities/${activityId}`,
+    {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(card),
-    });
-  } else {
-    await fetch(postUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(card),
-    });
-  }
+      body: JSON.stringify({
+        type: "message",
+        text: rag.answer ?? "No answer found.",
+      }),
+    },
+  );
 
   return new Response("ok");
 }
@@ -278,7 +263,8 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  log("➡️ Request", req.method, new URL(req.url).pathname);
-  if (new URL(req.url).pathname === "/teams") return handleTeams(req);
+  const path = new URL(req.url).pathname;
+  console.log("➡️ Request", req.method, path);
+  if (path === "/teams") return handleTeams(req);
   return new Response("ok");
 });
