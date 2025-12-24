@@ -1,11 +1,11 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS SAFE)
  *
- * ✔ Single global bot identity
- * ✔ Multi-tenant routing via AAD tenant id
- * ✔ Auto-provision tenant mapping
- * ✔ Uses EXACT serviceUrl from Teams (CRITICAL)
- * ✔ botframework.com token authority
+ * ✅ Single global bot identity
+ * ✅ Multi-tenant routing via AAD tenant id
+ * ✅ Auto-provision tenant mapping
+ * ✅ Uses EXACT serviceUrl from Teams
+ * ✅ Tenant-specific OAuth authority (CRITICAL FIX)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -98,16 +98,16 @@ async function verifyJwt(authHeader: string) {
 }
 
 /********************************************************************************************
- * BOT TOKEN (GLOBAL BOT)
+ * BOT TOKEN (TENANT-SPECIFIC AUTHORITY — REQUIRED)
  ********************************************************************************************/
-async function getBotToken() {
+async function getBotToken(aadTenantId: string) {
   console.log("🔑 Minting bot token", {
-    authority: "botframework.com",
+    authority: aadTenantId,
     client_id: TEAMS_BOT_APP_ID,
   });
 
   const res = await fetch(
-    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -126,7 +126,7 @@ async function getBotToken() {
     throw new Error("bot token failure");
   }
 
-  console.log("✅ Bot token minted");
+  console.log("✅ Bot token minted for tenant", aadTenantId);
   return json.access_token;
 }
 
@@ -168,10 +168,10 @@ async function handleTeams(req: Request): Promise<Response> {
 
   if (!tenantId) return new Response("ok");
 
-  // ✅ CRITICAL: use serviceUrl EXACTLY as provided (only trim trailing slash)
+  // 🔒 DO NOT REWRITE serviceUrl
   const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
 
-  const token = await getBotToken();
+  const token = await getBotToken(aadTenantId);
 
   /****************************
    * SEND PLACEHOLDER
@@ -192,7 +192,7 @@ async function handleTeams(req: Request): Promise<Response> {
       text: "⏳ Working on it…",
       replyToId: activity.replyToId ?? activity.id,
     }),
-  });
+  );
 
   if (!placeholderRes.ok) {
     console.error("❌ TEAMS API ERROR", {
