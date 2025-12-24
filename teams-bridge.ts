@@ -1,11 +1,11 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS SAFE)
  *
- * ✅ Single global bot identity
- * ✅ Multi-tenant routing via AAD tenant id
- * ✅ Auto-provision tenant mapping
- * ✅ Uses EXACT serviceUrl from Teams
- * ✅ Tenant-specific OAuth authority (CRITICAL FIX)
+ * ✔ Single global bot identity
+ * ✔ Multi-tenant routing via AAD tenant id
+ * ✔ Auto-provision tenant mapping
+ * ✔ Uses EXACT serviceUrl from Teams (DO NOT rewrite)
+ * ✔ Tenant-specific OAuth authority (CRITICAL)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -45,8 +45,8 @@ let jwks: jose.JSONWebKeySet | null = null;
 
 async function getJwks() {
   if (jwks) return jwks;
-  const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
-  jwks = await fetch(meta.jwks_uri).then(r => r.json());
+  const meta = await fetch(OPENID_CONFIG_URL).then((r) => r.json());
+  jwks = await fetch(meta.jwks_uri).then((r) => r.json());
   return jwks!;
 }
 
@@ -100,7 +100,7 @@ async function verifyJwt(authHeader: string) {
 /********************************************************************************************
  * BOT TOKEN (TENANT-SPECIFIC AUTHORITY — REQUIRED)
  ********************************************************************************************/
-async function getBotToken(aadTenantId: string) {
+async function getBotToken(aadTenantId: string): Promise<string> {
   console.log("🔑 Minting bot token", {
     authority: aadTenantId,
     client_id: TEAMS_BOT_APP_ID,
@@ -168,7 +168,7 @@ async function handleTeams(req: Request): Promise<Response> {
 
   if (!tenantId) return new Response("ok");
 
-  // 🔒 DO NOT REWRITE serviceUrl
+  // 🔒 DO NOT rewrite serviceUrl — use EXACT value from Teams
   const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
 
   const token = await getBotToken(aadTenantId);
@@ -205,6 +205,11 @@ async function handleTeams(req: Request): Promise<Response> {
   const placeholder = await placeholderRes.json().catch(() => ({}));
   const activityId = placeholder?.id;
 
+  if (!activityId) {
+    console.warn("⚠️ No placeholder activity id returned");
+    return new Response("ok");
+  }
+
   /****************************
    * RAG QUERY
    ****************************/
@@ -221,8 +226,12 @@ async function handleTeams(req: Request): Promise<Response> {
     }),
   });
 
-  const rag = await ragRes.json().catch(() => null);
-  if (!activityId || !rag) return new Response("ok");
+  if (!ragRes.ok) {
+    console.error("❌ RAG error", await ragRes.text());
+    return new Response("ok");
+  }
+
+  const rag = await ragRes.json();
 
   /****************************
    * PATCH FINAL MESSAGE
@@ -250,7 +259,7 @@ async function handleTeams(req: Request): Promise<Response> {
 /********************************************************************************************
  * SERVER
  ********************************************************************************************/
-serve(req => {
+serve((req) => {
   const path = new URL(req.url).pathname;
   console.log("➡️ Request", req.method, path);
   if (path === "/teams") return handleTeams(req);
