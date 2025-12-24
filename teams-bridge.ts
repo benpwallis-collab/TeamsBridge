@@ -1,27 +1,16 @@
-/********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS SAFE)
- *
- * ✔ Single global bot identity
- * ✔ Multi-tenant routing via AAD tenant id
- * ✔ Auto-provision tenant mapping
- * ✔ Uses EXACT serviceUrl from Teams (DO NOT rewrite)
- * ✔ Tenant-specific OAuth authority (CRITICAL)
- ********************************************************************************************/
-
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 
-/********************************************************************************************
- * ENV
- ********************************************************************************************/
-const {
-  INTERNAL_LOOKUP_SECRET,
-  TEAMS_TENANT_LOOKUP_URL,
-  RAG_QUERY_URL,
-  SUPABASE_ANON_KEY,
-  TEAMS_BOT_APP_ID,
-  TEAMS_BOT_APP_PASSWORD,
-} = Deno.env.toObject();
+/* ================= ENV ================= */
+
+const env = Deno.env.toObject();
+
+const INTERNAL_LOOKUP_SECRET = env.INTERNAL_LOOKUP_SECRET;
+const TEAMS_TENANT_LOOKUP_URL = env.TEAMS_TENANT_LOOKUP_URL;
+const RAG_QUERY_URL = env.RAG_QUERY_URL;
+const SUPABASE_ANON_KEY = env.SUPABASE_ANON_KEY;
+const TEAMS_BOT_APP_ID = env.TEAMS_BOT_APP_ID;
+const TEAMS_BOT_APP_PASSWORD = env.TEAMS_BOT_APP_PASSWORD;
 
 if (
   !INTERNAL_LOOKUP_SECRET ||
@@ -31,13 +20,12 @@ if (
   !TEAMS_BOT_APP_ID ||
   !TEAMS_BOT_APP_PASSWORD
 ) {
-  console.error("❌ Missing required env vars");
+  console.error("Missing env vars");
   Deno.exit(1);
 }
 
-/********************************************************************************************
- * BOTFRAMEWORK JWKS
- ********************************************************************************************/
+/* ================= JWKS ================= */
+
 const OPENID_CONFIG_URL =
   "https://login.botframework.com/v1/.well-known/openidconfiguration";
 
@@ -45,69 +33,32 @@ let jwks: jose.JSONWebKeySet | null = null;
 
 async function getJwks() {
   if (jwks) return jwks;
-  const meta = await fetch(OPENID_CONFIG_URL).then((r) => r.json());
-  jwks = await fetch(meta.jwks_uri).then((r) => r.json());
+  const meta = await fetch(OPENID_CONFIG_URL);
+  const metaJson = await meta.json();
+  const keys = await fetch(metaJson.jwks_uri);
+  jwks = await keys.json();
   return jwks!;
 }
 
-/********************************************************************************************
- * TENANT LOOKUP (AUTO-PROVISION)
- ********************************************************************************************/
-async function resolveTenant(aadTenantId: string): Promise<string | null> {
-  const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      "x-internal-token": INTERNAL_LOOKUP_SECRET,
-    },
-    body: JSON.stringify({
-      teams_tenant_id: aadTenantId,
-      auto_provision: true,
-    }),
-  });
+/* ================= AUTH ================= */
 
-  if (!res.ok) {
-    console.error("❌ tenant lookup failed", await res.text());
-    return null;
-  }
-
-  const json = await res.json();
-  return json?.tenant_id ?? null;
-}
-
-/********************************************************************************************
- * JWT VERIFY
- ********************************************************************************************/
 async function verifyJwt(authHeader: string) {
   const token = authHeader.slice(7);
-  const decoded = jose.decodeJwt(token);
-
-  console.log("🔐 Incoming JWT", {
-    aud: decoded.aud,
-    iss: decoded.iss,
-    tid: decoded.tid,
-  });
-
   const keyStore = jose.createLocalJWKSet(await getJwks());
 
   await jose.jwtVerify(token, keyStore, {
     issuer: "https://api.botframework.com",
-    audience: TEAMS_BOT_APP_ID,
+    audience: TEAMS_BOT_APP_ID
   });
 }
 
-/********************************************************************************************
- * BOT TOKEN (TENANT-SPECIFIC AUTHORITY — REQUIRED)
- ********************************************************************************************/
-async function getBotToken(aadTenantId: string): Promise<string> {
-  console.log("🔑 Minting bot token", {
-    authority: aadTenantId,
-    client_id: TEAMS_BOT_APP_ID,
-  });
+/* ================= BOT TOKEN ================= */
 
+async function getBotToken(aadTenantId: string) {
   const res = await fetch(
-    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
+    "https://login.microsoftonline.com/" +
+      aadTenantId +
+      "/oauth2/v2.0/token",
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -115,153 +66,98 @@ async function getBotToken(aadTenantId: string): Promise<string> {
         grant_type: "client_credentials",
         client_id: TEAMS_BOT_APP_ID,
         client_secret: TEAMS_BOT_APP_PASSWORD,
-        scope: "https://api.botframework.com/.default",
-      }),
-    },
+        scope: "https://api.botframework.com/.default"
+      })
+    }
   );
 
   const json = await res.json();
+
   if (!json.access_token) {
-    console.error("❌ Token mint failed", json);
+    console.error("Token failure", json);
     throw new Error("bot token failure");
   }
 
-  console.log("✅ Bot token minted for tenant", aadTenantId);
   return json.access_token;
 }
 
-/********************************************************************************************
- * MAIN HANDLER
- ********************************************************************************************/
-async function handleTeams(req: Request): Promise<Response> {
-  if (req.method !== "POST") return new Response("ok");
+/* ================= TENANT ================= */
 
-  let activity: any;
-  try {
-    activity = JSON.parse(await req.text());
-  } catch {
-    return new Response("ok");
-  }
-
-  const auth = req.headers.get("Authorization");
-  if (!auth?.startsWith("Bearer ")) return new Response("ok");
-
-  await verifyJwt(auth);
-
-  const aadTenantId =
-    activity.channelData?.tenant?.id || activity.conversation?.tenantId;
-
-  console.log("📨 Activity received", {
-    botAppId: TEAMS_BOT_APP_ID,
-    aadTenantId,
-    serviceUrl: activity.serviceUrl,
-    conversationId: activity.conversation?.id,
-  });
-
-  if (!aadTenantId || !activity.serviceUrl || !activity.conversation?.id) {
-    console.warn("⚠️ Missing required activity fields");
-    return new Response("ok");
-  }
-
-  const tenantId = await resolveTenant(aadTenantId);
-  console.log("🧭 Tenant resolved", tenantId);
-
-  if (!tenantId) return new Response("ok");
-
-  // 🔒 DO NOT rewrite serviceUrl — use EXACT value from Teams
-  const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
-
-  const token = await getBotToken(aadTenantId);
-
-  /****************************
-   * SEND PLACEHOLDER
-   ****************************/
-  const postUrl =
-    `${serviceUrl}/v3/conversations/${encodeURIComponent(
-      activity.conversation.id,
-    )}/activities`;
-
-  const placeholderRes = await fetch(postUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      type: "message",
-      text: "⏳ Working on it…",
-      replyToId: activity.replyToId ?? activity.id,
-    }),
-  );
-
-  if (!placeholderRes.ok) {
-    console.error("❌ TEAMS API ERROR", {
-      status: placeholderRes.status,
-      body: await placeholderRes.text(),
-    });
-    return new Response("ok");
-  }
-
-  const placeholder = await placeholderRes.json().catch(() => ({}));
-  const activityId = placeholder?.id;
-
-  if (!activityId) {
-    console.warn("⚠️ No placeholder activity id returned");
-    return new Response("ok");
-  }
-
-  /****************************
-   * RAG QUERY
-   ****************************/
-  const ragRes = await fetch(RAG_QUERY_URL, {
+async function resolveTenant(aadTenantId: string) {
+  const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       apikey: SUPABASE_ANON_KEY,
-      "x-tenant-id": tenantId,
+      "x-internal-token": INTERNAL_LOOKUP_SECRET
     },
     body: JSON.stringify({
-      question: activity.text,
-      source: "teams",
-    }),
+      teams_tenant_id: aadTenantId,
+      auto_provision: true
+    })
   });
 
-  if (!ragRes.ok) {
-    console.error("❌ RAG error", await ragRes.text());
+  if (!res.ok) return null;
+  const json = await res.json();
+  return json.tenant_id || null;
+}
+
+/* ================= HANDLER ================= */
+
+async function handleTeams(req: Request) {
+  if (req.method !== "POST") return new Response("ok");
+
+  const auth = req.headers.get("Authorization");
+  if (!auth || !auth.startsWith("Bearer ")) return new Response("ok");
+
+  const text = await req.text();
+  let activity: any;
+  try {
+    activity = JSON.parse(text);
+  } catch {
     return new Response("ok");
   }
 
-  const rag = await ragRes.json();
+  await verifyJwt(auth);
 
-  /****************************
-   * PATCH FINAL MESSAGE
-   ****************************/
-  await fetch(
-    `${serviceUrl}/v3/conversations/${encodeURIComponent(
-      activity.conversation.id,
-    )}/activities/${activityId}`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        type: "message",
-        text: rag.answer ?? "No answer found.",
-      }),
+  const aadTenantId =
+    activity.channelData?.tenant?.id ||
+    activity.conversation?.tenantId;
+
+  if (!aadTenantId) return new Response("ok");
+
+  const tenantId = await resolveTenant(aadTenantId);
+  if (!tenantId) return new Response("ok");
+
+  const serviceUrl = activity.serviceUrl.replace(/\/$/, "");
+  const token = await getBotToken(aadTenantId);
+
+  const postUrl =
+    serviceUrl +
+    "/v3/conversations/" +
+    encodeURIComponent(activity.conversation.id) +
+    "/activities";
+
+  await fetch(postUrl, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + token,
+      "Content-Type": "application/json"
     },
-  );
+    body: JSON.stringify({
+      type: "message",
+      text: "Hello from InnsynAI 👋"
+    })
+  });
 
   return new Response("ok");
 }
 
-/********************************************************************************************
- * SERVER
- ********************************************************************************************/
+/* ================= SERVER ================= */
+
 serve((req) => {
-  const path = new URL(req.url).pathname;
-  console.log("➡️ Request", req.method, path);
-  if (path === "/teams") return handleTeams(req);
+  if (new URL(req.url).pathname === "/teams") {
+    return handleTeams(req);
+  }
   return new Response("ok");
 });
