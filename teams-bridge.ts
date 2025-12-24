@@ -1,8 +1,8 @@
 /********************************************************************************************
  * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS MODE)
  *
- * FIX INCLUDED:
- *   ✅ Normalizes serviceUrl (CRITICAL for EU tenants)
+ * CRITICAL FIX:
+ *   ✅ Rewrites serviceUrl to *.ng.msg.teams.microsoft.com (required for replies)
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -18,7 +18,6 @@ const {
   SUPABASE_ANON_KEY,
   TEAMS_BOT_APP_ID,
   TEAMS_BOT_APP_PASSWORD,
-  CONNECT_URL,
 } = Deno.env.toObject();
 
 if (
@@ -49,11 +48,25 @@ async function getJwks() {
 }
 
 /********************************************************************************************
- * 🔥 CRITICAL FIX: normalize serviceUrl
+ * 🔥 CRITICAL FIX: map serviceUrl → ng.msg.teams.microsoft.com
  ********************************************************************************************/
-function normalizeServiceUrl(url: string): string {
-  // Removes trailing tenant id: /emea/{tenant-guid}/ → /emea/
-  return url.replace(/\/[0-9a-fA-F-]{36}\/?$/, "/");
+function normalizeServiceUrl(serviceUrl: string): string {
+  // Examples:
+  // https://smba.trafficmanager.net/emea/{tenantId}/
+  // → https://emea.ng.msg.teams.microsoft.com
+
+  if (serviceUrl.includes("/emea/")) {
+    return "https://emea.ng.msg.teams.microsoft.com";
+  }
+  if (serviceUrl.includes("/amer/")) {
+    return "https://amer.ng.msg.teams.microsoft.com";
+  }
+  if (serviceUrl.includes("/apac/")) {
+    return "https://apac.ng.msg.teams.microsoft.com";
+  }
+
+  // Safe fallback (EU)
+  return "https://emea.ng.msg.teams.microsoft.com";
 }
 
 /********************************************************************************************
@@ -104,11 +117,11 @@ async function verifyJwt(authHeader: string) {
 }
 
 /********************************************************************************************
- * BOT TOKEN (GLOBAL BOT, BOTFRAMEWORK AUTHORITY)
+ * BOT TOKEN (GLOBAL BOT)
  ********************************************************************************************/
 async function getBotToken() {
   console.log("🔑 Minting bot token", {
-    tenant: "botframework.com",
+    authority: "botframework.com",
     client_id: TEAMS_BOT_APP_ID,
   });
 
@@ -142,11 +155,9 @@ async function getBotToken() {
 async function handleTeams(req: Request): Promise<Response> {
   if (req.method !== "POST") return new Response("ok");
 
-  const body = await req.text();
   let activity: any;
-
   try {
-    activity = JSON.parse(body);
+    activity = JSON.parse(await req.text());
   } catch {
     return new Response("ok");
   }
@@ -172,15 +183,10 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const tenantId = await resolveTenant(aadTenantId);
   console.log("🧭 Tenant resolved", tenantId);
-
   if (!tenantId) return new Response("ok");
 
   const serviceUrl = normalizeServiceUrl(activity.serviceUrl);
-
-  console.log("🌐 Service URL normalized", {
-    original: activity.serviceUrl,
-    normalized: serviceUrl,
-  });
+  console.log("🌐 Service URL rewritten", serviceUrl);
 
   const token = await getBotToken();
 
@@ -188,7 +194,7 @@ async function handleTeams(req: Request): Promise<Response> {
    * SEND PLACEHOLDER
    ****************************/
   const postUrl =
-    `${serviceUrl}v3/conversations/${encodeURIComponent(
+    `${serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation.id,
     )}/activities`;
 
@@ -215,6 +221,7 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const placeholder = await placeholderRes.json().catch(() => ({}));
   const activityId = placeholder?.id;
+  if (!activityId) return new Response("ok");
 
   /****************************
    * RAG QUERY
@@ -233,14 +240,13 @@ async function handleTeams(req: Request): Promise<Response> {
   });
 
   const rag = await ragRes.json().catch(() => null);
-
-  if (!activityId || !rag) return new Response("ok");
+  if (!rag) return new Response("ok");
 
   /****************************
    * PATCH FINAL MESSAGE
    ****************************/
   await fetch(
-    `${serviceUrl}v3/conversations/${encodeURIComponent(
+    `${serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation.id,
     )}/activities/${activityId}`,
     {
