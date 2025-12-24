@@ -6,6 +6,7 @@
  * ✅ Auto-provision tenant mapping via teams-tenant-lookup (auto_provision: true)
  * ✅ Inline RAG execution (no background async)
  * ✅ Immediate placeholder message, then PATCH with adaptive card + sources + feedback
+ * ✅ If Teams does NOT return placeholder activity id (204 / empty), fallback to POST final message
  * ✅ Feedback preserved (/feedback) using x-internal-token
  * ✅ Strong, Render-friendly logging (aadTenantId + resolved tenantId + botAppId)
  *
@@ -47,7 +48,9 @@ if (
   !TEAMS_BOT_APP_ID ||
   !TEAMS_BOT_APP_PASSWORD
 ) {
-  console.error("❌ Missing env vars. Required: INTERNAL_LOOKUP_SECRET, TEAMS_TENANT_LOOKUP_URL, RAG_QUERY_URL, SUPABASE_ANON_KEY, TEAMS_BOT_APP_ID, TEAMS_BOT_APP_PASSWORD");
+  console.error(
+    "❌ Missing env vars. Required: INTERNAL_LOOKUP_SECRET, TEAMS_TENANT_LOOKUP_URL, RAG_QUERY_URL, SUPABASE_ANON_KEY, TEAMS_BOT_APP_ID, TEAMS_BOT_APP_PASSWORD",
+  );
   Deno.exit(1);
 }
 
@@ -125,7 +128,9 @@ function formatSourcesForCard(sources: any[]): any[] {
 /********************************************************************************************
  * TENANT LOOKUP (AUTO-PROVISION)
  ********************************************************************************************/
-async function resolveOrCreateTenantId(aadTenantId: string): Promise<string | null> {
+async function resolveOrCreateTenantId(
+  aadTenantId: string,
+): Promise<string | null> {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
@@ -140,7 +145,11 @@ async function resolveOrCreateTenantId(aadTenantId: string): Promise<string | nu
   });
 
   if (!res.ok) {
-    console.error("❌ teams-tenant-lookup failed", res.status, await res.text().catch(() => ""));
+    console.error(
+      "❌ teams-tenant-lookup failed",
+      res.status,
+      await res.text().catch(() => ""),
+    );
     return null;
   }
 
@@ -204,39 +213,83 @@ interface TeamsActivity {
 }
 
 /********************************************************************************************
- * SEND MESSAGE HELPERS
+ * TEAMS SEND HELPERS
  ********************************************************************************************/
-async function sendPlaceholder(activity: TeamsActivity, accessToken: string): Promise<string | null> {
-  if (!activity.serviceUrl || !activity.conversation?.id) return null;
-
-  const res = await fetch(
-    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        type: "message",
-        text: "⏳ Working on it…",
-        replyToId: activity.replyToId ?? activity.id,
-      }),
-    },
-  );
-
-  const json = await res.json().catch(() => ({}));
-  return json?.id ?? null;
-}
-
-async function patchWithCard(
+async function sendActivity(
   activity: TeamsActivity,
   accessToken: string,
-  placeholderActivityId: string,
-  rag: any,
-) {
-  if (!activity.serviceUrl || !activity.conversation?.id) return;
+  payload: any,
+): Promise<{ ok: boolean; id: string | null; status: number; bodyText: string }> {
+  const url =
+    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
+      activity.conversation!.id,
+    )}/activities`;
 
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const contentType = res.headers.get("content-type") || "";
+  let id: string | null = null;
+
+  // Teams sometimes returns 200 with JSON { id }, or 204 with no content
+  if (contentType.includes("application/json")) {
+    try {
+      const json = await res.json();
+      id = json?.id ?? null;
+    } catch {
+      id = null;
+    }
+  } else {
+    // best-effort to read text for debugging
+    try {
+      await res.text();
+    } catch {
+      // ignore
+    }
+  }
+
+  let bodyText = "";
+  try {
+    // Try to read (may be empty / already consumed). Safe best-effort.
+    bodyText = "";
+  } catch {
+    bodyText = "";
+  }
+
+  return { ok: res.ok, id, status: res.status, bodyText };
+}
+
+async function putActivity(
+  activity: TeamsActivity,
+  accessToken: string,
+  activityId: string,
+  payload: any,
+): Promise<{ ok: boolean; status: number; text: string }> {
+  const url =
+    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
+      activity.conversation!.id,
+    )}/activities/${activityId}`;
+
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, text };
+}
+
+function buildCardPayload(rag: any) {
   const actions = rag?.qa_log_id
     ? [
         {
@@ -247,12 +300,15 @@ async function patchWithCard(
         {
           type: "Action.Submit",
           title: "👎 Not helpful",
-          data: { action: "feedback", feedback: "down", qa_log_id: rag.qa_log_id },
+          data: {
+            action: "feedback",
+            feedback: "down",
+            qa_log_id: rag.qa_log_id,
+          },
         },
       ]
     : [];
 
-  // If RAG returns setup prompt, optionally append a connect link
   let answerText = rag?.answer ?? "No answer found.";
   if (rag?.status === "no_documents" && CONNECT_URL) {
     answerText = `${answerText}\n\nSetup: ${CONNECT_URL}`;
@@ -267,36 +323,20 @@ async function patchWithCard(
     ...formatSourcesForCard(rag?.sources ?? []),
   ];
 
-  const res = await fetch(
-    `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(activity.conversation.id)}/activities/${placeholderActivityId}`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
+  return {
+    type: "message",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: cardBody,
+          actions,
+        },
       },
-      body: JSON.stringify({
-        type: "message",
-        attachments: [
-          {
-            contentType: "application/vnd.microsoft.card.adaptive",
-            content: {
-              type: "AdaptiveCard",
-              version: "1.4",
-              body: cardBody,
-              actions,
-            },
-          },
-        ],
-      }),
-    },
-  );
-
-  if (!res.ok) {
-    console.error("❌ PATCH failed", res.status, await res.text().catch(() => ""));
-  } else {
-    console.log("✅ Message updated");
-  }
+    ],
+  };
 }
 
 /********************************************************************************************
@@ -331,14 +371,26 @@ async function handleTeams(req: Request): Promise<Response> {
 
   console.log(
     "📨 Activity",
-    "botAppId=", TEAMS_BOT_APP_ID,
-    "aadTenantId=", aadTenantId ?? "missing",
-    "conversationId=", activity.conversation?.id ?? "missing",
-    "activityId=", activity.id ?? "missing",
-    "from=", activity.from?.id ?? "missing",
-    "type=", activity.type ?? "missing",
-    "text=", activity.text ? safeStr(activity.text, 80) : "none",
+    "botAppId=",
+    TEAMS_BOT_APP_ID,
+    "aadTenantId=",
+    aadTenantId ?? "missing",
+    "conversationId=",
+    activity.conversation?.id ?? "missing",
+    "activityId=",
+    activity.id ?? "missing",
+    "from=",
+    activity.from?.id ?? "missing",
+    "type=",
+    activity.type ?? "missing",
+    "text=",
+    activity.text ? safeStr(activity.text, 80) : "none",
   );
+
+  if (!activity.serviceUrl || !activity.conversation?.id) {
+    console.warn("⚠️ Missing serviceUrl or conversation.id");
+    return new Response("ok");
+  }
 
   if (!aadTenantId) {
     console.warn("⚠️ Missing AAD tenant id");
@@ -346,10 +398,19 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   const tenantId = await resolveOrCreateTenantId(aadTenantId);
-  console.log("🧭 Tenant resolved", "aadTenantId=", aadTenantId, "-> tenantId=", tenantId ?? "NOT_FOUND");
+  console.log(
+    "🧭 Tenant resolved",
+    "aadTenantId=",
+    aadTenantId,
+    "-> tenantId=",
+    tenantId ?? "NOT_FOUND",
+  );
 
   if (!tenantId) {
-    console.error("❌ Unable to resolve or create tenant for AAD tenant:", aadTenantId);
+    console.error(
+      "❌ Unable to resolve or create tenant for AAD tenant:",
+      aadTenantId,
+    );
     return new Response("ok");
   }
 
@@ -359,25 +420,31 @@ async function handleTeams(req: Request): Promise<Response> {
   if (activity.value?.action === "feedback") {
     console.log("👍 Feedback received", safeStr(activity.value, 400));
 
-    // Forward to feedback endpoint (internal token, no tenant spoof)
-    const feedbackRes = await fetch(RAG_QUERY_URL.replace(/\/rag-query\/?$/, "/feedback"), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-        "x-internal-token": INTERNAL_LOOKUP_SECRET,
+    const feedbackRes = await fetch(
+      RAG_QUERY_URL.replace(/\/rag-query\/?$/, "/feedback"),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          apikey: SUPABASE_ANON_KEY,
+          "x-internal-token": INTERNAL_LOOKUP_SECRET,
+        },
+        body: JSON.stringify({
+          qa_log_id: activity.value.qa_log_id,
+          feedback: activity.value.feedback,
+          tenant_id: tenantId,
+          source: "teams",
+          teams_user_id: activity.from?.id ?? null,
+        }),
       },
-      body: JSON.stringify({
-        qa_log_id: activity.value.qa_log_id,
-        feedback: activity.value.feedback,
-        tenant_id: tenantId,
-        source: "teams",
-        teams_user_id: activity.from?.id ?? null,
-      }),
-    });
+    );
 
     if (!feedbackRes.ok) {
-      console.error("❌ Feedback forward failed", feedbackRes.status, await feedbackRes.text().catch(() => ""));
+      console.error(
+        "❌ Feedback forward failed",
+        feedbackRes.status,
+        await feedbackRes.text().catch(() => ""),
+      );
     }
 
     return new Response("ok");
@@ -386,18 +453,33 @@ async function handleTeams(req: Request): Promise<Response> {
   if (!activity.text?.trim()) return new Response("ok");
 
   /****************************
-   * SEND PLACEHOLDER
+   * GET BOT TOKEN
    ****************************/
-  let accessToken: string;
+  let token: string;
   try {
-    accessToken = await getBotAccessToken(aadTenantId);
+    token = await getBotAccessToken(aadTenantId);
   } catch (e) {
     console.error("❌ Bot token failure (cannot respond)", e);
     return new Response("ok");
   }
 
-  const placeholderActivityId = await sendPlaceholder(activity, accessToken);
-  console.log("🕒 Placeholder sent", "placeholderActivityId=", placeholderActivityId ?? "missing");
+  /****************************
+   * SEND PLACEHOLDER (BEST-EFFORT ID)
+   ****************************/
+  const placeholderPayload = {
+    type: "message",
+    text: "⏳ Working on it…",
+    replyToId: activity.replyToId ?? activity.id,
+  };
+
+  const placeholderRes = await sendActivity(activity, token, placeholderPayload);
+  console.log(
+    "🕒 Placeholder sent",
+    "status=",
+    placeholderRes.status,
+    "placeholderActivityId=",
+    placeholderRes.id ?? "none",
+  );
 
   /****************************
    * RAG QUERY (INLINE)
@@ -416,31 +498,65 @@ async function handleTeams(req: Request): Promise<Response> {
   });
 
   if (!ragRes.ok) {
-    console.error("❌ RAG failed", ragRes.status, await ragRes.text().catch(() => ""));
-    // If we can't patch, at least don't crash
+    console.error(
+      "❌ RAG failed",
+      ragRes.status,
+      await ragRes.text().catch(() => ""),
+    );
     return new Response("ok");
   }
 
   const rag = await ragRes.json().catch(() => null);
   console.log(
     "🧠 RAG completed",
-    "tenantId=", tenantId,
-    "qa_log_id=", rag?.qa_log_id ?? "none",
-    "sources=", rag?.sources?.length ?? 0,
+    "tenantId=",
+    tenantId,
+    "qa_log_id=",
+    rag?.qa_log_id ?? "none",
+    "sources=",
+    rag?.sources?.length ?? 0,
   );
 
+  const finalCardPayload = buildCardPayload(rag);
+
   /****************************
-   * PATCH PLACEHOLDER WITH ANSWER CARD
+   * PATCH IF WE HAVE ID, ELSE POST FINAL MESSAGE
    ****************************/
-  if (!placeholderActivityId) {
-    // If placeholder id missing, nothing to patch; return ok
-    console.warn("⚠️ Missing placeholderActivityId; cannot patch");
+  // Re-mint token for final send (safe)
+  const patchToken = await getBotAccessToken(aadTenantId);
+
+  if (placeholderRes.id) {
+    const putRes = await putActivity(
+      activity,
+      patchToken,
+      placeholderRes.id,
+      finalCardPayload,
+    );
+
+    if (!putRes.ok) {
+      console.error("❌ PUT failed; falling back to POST", putRes.status, putRes.text);
+
+      const postFinal = await sendActivity(activity, patchToken, finalCardPayload);
+      if (!postFinal.ok) {
+        console.error("❌ POST final also failed", postFinal.status);
+      } else {
+        console.log("✅ Final message POSTed (fallback)", "id=", postFinal.id ?? "none");
+      }
+    } else {
+      console.log("✅ Message updated (PUT)");
+    }
+
     return new Response("ok");
   }
 
-  // Re-mint token for patch (safe, and avoids token expiry edge cases)
-  const patchToken = await getBotAccessToken(aadTenantId);
-  await patchWithCard(activity, patchToken, placeholderActivityId, rag);
+  console.warn("⚠️ No placeholderActivityId; sending final message as new activity");
+  const postFinal = await sendActivity(activity, patchToken, finalCardPayload);
+
+  if (!postFinal.ok) {
+    console.error("❌ POST final failed", postFinal.status);
+  } else {
+    console.log("✅ Final message POSTed", "id=", postFinal.id ?? "none");
+  }
 
   return new Response("ok");
 }
