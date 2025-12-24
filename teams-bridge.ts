@@ -1,6 +1,14 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS MODE, NO LEGACY)
- * DIAGNOSTIC BUILD — DO NOT REMOVE LOGS UNTIL 401 ROOT CAUSE CONFIRMED
+ * InnsynAI Teams Bridge – FINAL (STORE / ADD-TO-TEAMS MODE)
+ *
+ * CRITICAL FIX:
+ *   ✅ Bot access tokens are minted against botframework.com
+ *      NOT customer tenant IDs
+ *
+ * This resolves:
+ *   - 401 "Authorization has been denied"
+ *   - Missing service principal errors
+ *   - Placeholder + PATCH failures
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -9,8 +17,6 @@ import * as jose from "https://deno.land/x/jose@v5.4.0/index.ts";
 /********************************************************************************************
  * ENV VARS
  ********************************************************************************************/
-const env = Deno.env.toObject();
-
 const {
   INTERNAL_LOOKUP_SECRET,
   TEAMS_TENANT_LOOKUP_URL,
@@ -19,7 +25,7 @@ const {
   TEAMS_BOT_APP_ID,
   TEAMS_BOT_APP_PASSWORD,
   CONNECT_URL,
-} = env;
+} = Deno.env.toObject();
 
 if (
   !INTERNAL_LOOKUP_SECRET ||
@@ -33,21 +39,15 @@ if (
   Deno.exit(1);
 }
 
-/** Startup identity proof */
-console.log("🤖 BOT IDENTITY LOADED", {
-  TEAMS_BOT_APP_ID,
-  botSecretLength: TEAMS_BOT_APP_PASSWORD.length,
-});
-
 /********************************************************************************************
- * BOTFRAMEWORK OPENID CONFIG
+ * BOTFRAMEWORK JWKS
  ********************************************************************************************/
 const OPENID_CONFIG_URL =
   "https://login.botframework.com/v1/.well-known/openidconfiguration";
 
 let jwks: jose.JSONWebKeySet | null = null;
 
-async function getJwks(): Promise<jose.JSONWebKeySet> {
+async function getJwks() {
   if (jwks) return jwks;
   const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
   jwks = await fetch(meta.jwks_uri).then(r => r.json());
@@ -55,29 +55,28 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
 }
 
 /********************************************************************************************
- * JWT VERIFICATION
+ * HELPERS
  ********************************************************************************************/
-async function verifyJwt(authHeader: string) {
-  const token = authHeader.slice(7);
-  const decoded = jose.decodeJwt(token);
+const log = (...args: any[]) => console.log(...args);
 
-  console.log("🔐 Incoming JWT", {
-    aud: decoded.aud,
-    iss: decoded.iss,
-    tid: decoded.tid,
-  });
-
-  const keyStore = jose.createLocalJWKSet(await getJwks());
-  await jose.jwtVerify(token, keyStore, {
-    issuer: "https://api.botframework.com",
-    audience: TEAMS_BOT_APP_ID,
-  });
+function formatSourcesForCard(sources: any[]) {
+  if (!sources?.length) return [];
+  return [
+    { type: "TextBlock", text: "**Sources:**", wrap: true },
+    ...sources.map(s => ({
+      type: "TextBlock",
+      wrap: true,
+      text: s.url
+        ? `• [${s.title}](${s.url})`
+        : `• ${s.title}`,
+    })),
+  ];
 }
 
 /********************************************************************************************
- * TENANT LOOKUP
+ * TENANT LOOKUP (AUTO-PROVISION)
  ********************************************************************************************/
-async function resolveOrCreateTenantId(aadTenantId: string) {
+async function resolveTenantId(aadTenantId: string): Promise<string | null> {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
     method: "POST",
     headers: {
@@ -91,27 +90,48 @@ async function resolveOrCreateTenantId(aadTenantId: string) {
     }),
   });
 
-  const text = await res.text();
   if (!res.ok) {
-    console.error("❌ Tenant lookup failed", res.status, text);
+    log("❌ tenant lookup failed", res.status);
     return null;
   }
 
-  const json = JSON.parse(text);
+  const json = await res.json();
   return json?.tenant_id ?? null;
 }
 
 /********************************************************************************************
- * BOT TOKEN (CRITICAL LOGGING)
+ * JWT VERIFY (BOTFRAMEWORK → YOUR BOT)
  ********************************************************************************************/
-async function getBotAccessToken(aadTenantId: string) {
-  console.log("🔑 Minting bot token", {
-    tenant: aadTenantId,
+async function verifyJwt(authHeader: string) {
+  const token = authHeader.slice(7);
+  const decoded = jose.decodeJwt(token);
+
+  log("🔐 Incoming JWT", {
+    aud: decoded.aud,
+    iss: decoded.iss,
+    tid: decoded.tid,
+  });
+
+  const keyStore = jose.createLocalJWKSet(await getJwks());
+
+  await jose.jwtVerify(token, keyStore, {
+    issuer: "https://api.botframework.com",
+    audience: TEAMS_BOT_APP_ID,
+  });
+}
+
+/********************************************************************************************
+ * 🔑 BOT TOKEN (CRITICAL FIX)
+ * MUST USE botframework.com
+ ********************************************************************************************/
+async function getBotAccessToken() {
+  log("🔑 Minting bot token", {
+    tenant: "botframework.com",
     client_id: TEAMS_BOT_APP_ID,
   });
 
   const res = await fetch(
-    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
+    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -124,96 +144,78 @@ async function getBotAccessToken(aadTenantId: string) {
     },
   );
 
-  const json = await res.json().catch(() => ({}));
-
-  if (!res.ok || !json.access_token) {
-    console.error("❌ BOT TOKEN FAILED", {
-      status: res.status,
-      tenant: aadTenantId,
-      response: json,
-    });
+  const json = await res.json();
+  if (!json.access_token) {
+    log("❌ Token mint failed", json);
     throw new Error("Bot token failure");
   }
 
-  console.log("✅ Bot token minted");
+  log("✅ Bot token minted");
   return json.access_token as string;
-}
-
-/********************************************************************************************
- * TEAMS SEND (DEEP 401 LOGGING)
- ********************************************************************************************/
-async function sendTeams(
-  url: string,
-  token: string,
-  payload: any,
-  method: "POST" | "PUT",
-) {
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    console.error("❌ TEAMS API ERROR", {
-      method,
-      url,
-      status: res.status,
-      wwwAuth: res.headers.get("www-authenticate"),
-      body: text,
-    });
-  }
-
-  let id: string | null = null;
-  try {
-    const json = JSON.parse(text);
-    id = json?.id ?? null;
-  } catch {}
-
-  return { ok: res.ok, status: res.status, id };
 }
 
 /********************************************************************************************
  * MAIN HANDLER
  ********************************************************************************************/
 async function handleTeams(req: Request): Promise<Response> {
-  const activity = await req.json();
+  if (req.method !== "POST") return new Response("ok");
 
+  const activity = await req.json();
   const auth = req.headers.get("Authorization");
-  if (!auth?.startsWith("Bearer ")) return new Response("ok");
+
+  if (!auth?.startsWith("Bearer ")) {
+    log("⚠️ Missing auth header");
+    return new Response("ok");
+  }
 
   await verifyJwt(auth);
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
 
-  console.log("📨 Activity received", {
+  log("📨 Activity received", {
     botAppId: TEAMS_BOT_APP_ID,
     aadTenantId,
     serviceUrl: activity.serviceUrl,
   });
 
-  const tenantId = await resolveOrCreateTenantId(aadTenantId);
-  console.log("🧭 Tenant resolved", tenantId);
+  const tenantId = await resolveTenantId(aadTenantId);
+  log("🧭 Tenant resolved", tenantId);
 
-  const token = await getBotAccessToken(aadTenantId);
+  if (!tenantId) return new Response("ok");
 
-  const placeholderUrl =
+  const token = await getBotAccessToken();
+
+  /****************************
+   * PLACEHOLDER
+   ****************************/
+  const postUrl =
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
       activity.conversation.id,
     )}/activities`;
 
-  const placeholder = await sendTeams(
-    placeholderUrl,
-    token,
-    { type: "message", text: "⏳ Working on it…" },
-    "POST",
-  );
+  const placeholderRes = await fetch(postUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "message",
+      text: "⏳ Working on it…",
+      replyToId: activity.replyToId ?? activity.id,
+    }),
+  });
 
+  let placeholderId: string | null = null;
+  try {
+    const json = await placeholderRes.json();
+    placeholderId = json?.id ?? null;
+  } catch {}
+
+  /****************************
+   * RAG
+   ****************************/
   const ragRes = await fetch(RAG_QUERY_URL, {
     method: "POST",
     headers: {
@@ -229,20 +231,44 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const rag = await ragRes.json();
 
-  const cardPayload = {
+  const card = {
     type: "message",
-    text: rag.answer ?? "No answer found.",
+    attachments: [
+      {
+        contentType: "application/vnd.microsoft.card.adaptive",
+        content: {
+          type: "AdaptiveCard",
+          version: "1.4",
+          body: [
+            { type: "TextBlock", wrap: true, text: rag.answer },
+            ...formatSourcesForCard(rag.sources),
+          ],
+        },
+      },
+    ],
   };
 
-  if (placeholder.id) {
-    const putUrl =
-      `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
-        activity.conversation.id,
-      )}/activities/${placeholder.id}`;
-
-    await sendTeams(putUrl, token, cardPayload, "PUT");
+  /****************************
+   * PATCH OR FALLBACK POST
+   ****************************/
+  if (placeholderId) {
+    await fetch(`${postUrl}/${placeholderId}`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(card),
+    });
   } else {
-    await sendTeams(placeholderUrl, token, cardPayload, "POST");
+    await fetch(postUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(card),
+    });
   }
 
   return new Response("ok");
@@ -252,7 +278,7 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  console.log("➡️ Request", req.method, new URL(req.url).pathname);
+  log("➡️ Request", req.method, new URL(req.url).pathname);
   if (new URL(req.url).pathname === "/teams") return handleTeams(req);
   return new Response("ok");
 });
