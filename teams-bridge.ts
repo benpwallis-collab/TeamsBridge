@@ -1,14 +1,10 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – BASELINE (MATCHES WORKING TOKEN FLOW)
+ * InnsynAI Teams Bridge – BASELINE (GLOBAL BOT, CROSS-TENANT SAFE)
  *
  * PURPOSE:
  * - Prove Teams → Bot → Teams roundtrip works
- * - No PATCH
- * - No RAG
- * - No Adaptive Cards
- *
- * Key change vs your failing baseline:
- * - Mint bot token from customer tenant authority (WORKED in your per-tenant bot version)
+ * - Works in HOME tenant AND EXTERNAL tenants
+ * - Marketplace-correct auth model
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -46,20 +42,23 @@ let jwks: jose.JSONWebKeySet | null = null;
 
 async function getJwks() {
   if (jwks) return jwks;
-  const meta = await fetch(OPENID_CONFIG_URL).then((r) => r.json());
-  jwks = await fetch(meta.jwks_uri).then((r) => r.json());
+  const meta = await fetch(OPENID_CONFIG_URL).then(r => r.json());
+  jwks = await fetch(meta.jwks_uri).then(r => r.json());
   return jwks!;
 }
 
 /********************************************************************************************
  * JWT VERIFY (INBOUND)
+ * IMPORTANT: validate against the *actual aud* sent by Teams
  ********************************************************************************************/
-async function verifyJwt(authHeader: string) {
+async function verifyJwt(authHeader: string): Promise<string> {
   const token = authHeader.slice(7);
   const decoded = jose.decodeJwt(token);
 
+  const botAppId = decoded.aud as string;
+
   console.log("🔐 Incoming JWT", {
-    aud: decoded.aud,
+    aud: botAppId,
     iss: decoded.iss,
     tid: decoded.tid,
   });
@@ -68,8 +67,10 @@ async function verifyJwt(authHeader: string) {
 
   await jose.jwtVerify(token, keyStore, {
     issuer: "https://api.botframework.com",
-    audience: TEAMS_BOT_APP_ID,
+    audience: botAppId,
   });
+
+  return botAppId;
 }
 
 /********************************************************************************************
@@ -99,16 +100,13 @@ async function resolveTenant(aadTenantId: string): Promise<string | null> {
 }
 
 /********************************************************************************************
- * BOT TOKEN (CUSTOMER TENANT AUTHORITY — this matches your working version)
+ * BOT TOKEN (GLOBAL BOTFRAMEWORK AUTHORITY – REQUIRED)
  ********************************************************************************************/
-async function getBotToken(aadTenantId: string): Promise<string> {
-  console.log("🔑 Minting bot token", {
-    authority: aadTenantId,
-    client_id: TEAMS_BOT_APP_ID,
-  });
+async function getBotToken(): Promise<string> {
+  console.log("🔑 Minting bot token (botframework.com)");
 
   const res = await fetch(
-    `https://login.microsoftonline.com/${aadTenantId}/oauth2/v2.0/token`,
+    "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
     {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -128,7 +126,6 @@ async function getBotToken(aadTenantId: string): Promise<string> {
     throw new Error("bot token failure");
   }
 
-  console.log("✅ Bot token minted");
   return json.access_token;
 }
 
@@ -146,9 +143,14 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   const auth = req.headers.get("Authorization");
-  if (!auth || !auth.startsWith("Bearer ")) return new Response("ok");
+  if (!auth?.startsWith("Bearer ")) return new Response("ok");
 
-  await verifyJwt(auth);
+  const botAppId = await verifyJwt(auth);
+
+  if (botAppId !== TEAMS_BOT_APP_ID) {
+    console.warn("⚠️ JWT aud does not match configured bot id");
+    return new Response("ok");
+  }
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
@@ -156,26 +158,18 @@ async function handleTeams(req: Request): Promise<Response> {
   console.log("📨 Activity received", {
     aadTenantId,
     conversationType: activity.conversation?.conversationType,
-    serviceUrl: activity.serviceUrl,
-    conversationId: activity.conversation?.id,
-    activityId: activity.id,
-    replyToId: activity.replyToId,
     text: activity.text,
   });
 
   if (!aadTenantId || !activity.serviceUrl || !activity.conversation?.id) {
-    console.warn("⚠️ Missing required activity fields");
     return new Response("ok");
   }
 
   const tenantId = await resolveTenant(aadTenantId);
-  console.log("🧭 Tenant resolved", tenantId);
   if (!tenantId) return new Response("ok");
 
-  // Preserve exact serviceUrl, but avoid double slashes
   const serviceUrl = String(activity.serviceUrl).replace(/\/$/, "");
-
-  const token = await getBotToken(aadTenantId);
+  const token = await getBotToken();
 
   const postUrl =
     serviceUrl +
@@ -192,20 +186,16 @@ async function handleTeams(req: Request): Promise<Response> {
     body: JSON.stringify({
       type: "message",
       text: "Hello from InnsynAI 👋",
-      // This mirrors the version that worked
-      replyToId: activity.replyToId ?? activity.id,
+      from: activity.recipient,
+      recipient: activity.from,
+      conversation: { id: activity.conversation.id },
     }),
   });
 
-  const bodyText = await res.text();
   if (!res.ok) {
-    console.error("❌ Teams send failed", res.status, bodyText);
-
-    // Helpful: many times the real clue is in WWW-Authenticate
-    const wwwAuth = res.headers.get("www-authenticate");
-    if (wwwAuth) console.error("🔎 WWW-Authenticate:", wwwAuth);
+    console.error("❌ Teams send failed", res.status, await res.text());
   } else {
-    console.log("✅ Message sent to Teams", bodyText);
+    console.log("✅ Message sent to Teams");
   }
 
   return new Response("ok");
