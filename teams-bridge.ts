@@ -180,10 +180,14 @@ async function handleTeams(req: Request): Promise<Response> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      type: "message",
-      text: "Hello from InnsynAI 👋",
-    }),
-  });
+  type: "message",
+  text: "Hello from InnsynAI 👋",
+  from: activity.recipient,
+  recipient: activity.from,
+  conversation: {
+    id: activity.conversation.id,
+  },
+}),
 
   if (!res.ok) {
     console.error("❌ Teams send failed", res.status, await res.text());
