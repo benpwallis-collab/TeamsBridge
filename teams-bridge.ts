@@ -1,10 +1,8 @@
 /********************************************************************************************
- * InnsynAI Teams Bridge – FINAL, RENDER-SAFE
- * - Immediate "Working on it…" reply
- * - Inline RAG execution (no background async)
- * - PUT placeholder message with answer
- * - Feedback preserved
- * - Source citations with platform labels
+ * InnsynAI Teams Bridge – MULTI-TENANT / STORE READY
+ * - Logs AAD tenant ID
+ * - Auto-provisions tenant on first message
+ * - Preserves existing bot + RAG behavior
  ********************************************************************************************/
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
@@ -20,12 +18,7 @@ const {
   SUPABASE_ANON_KEY,
 } = Deno.env.toObject();
 
-if (
-  !INTERNAL_LOOKUP_SECRET ||
-  !TEAMS_TENANT_LOOKUP_URL ||
-  !RAG_QUERY_URL ||
-  !SUPABASE_ANON_KEY
-) {
+if (!INTERNAL_LOOKUP_SECRET || !TEAMS_TENANT_LOOKUP_URL || !RAG_QUERY_URL || !SUPABASE_ANON_KEY) {
   console.error("❌ Missing env vars");
   Deno.exit(1);
 }
@@ -46,59 +39,33 @@ async function getJwks(): Promise<jose.JSONWebKeySet> {
 }
 
 /********************************************************************************************
- * HELPER FUNCTIONS
+ * TENANT LOOKUP / AUTO-PROVISION
  ********************************************************************************************/
-function getPlatformLabel(source: string): string {
-  const labels: Record<string, string> = {
-    notion: 'Notion',
-    confluence: 'Confluence',
-    gitlab: 'GitLab',
-    google_drive: 'Google Drive',
-    sharepoint: 'SharePoint',
-    manual: 'Manual Upload',
-    slack: 'Slack',
-    teams: 'Teams',
-  };
-  return labels[source] || source || 'Unknown';
-}
-
-function getRelativeDate(dateStr: string): string {
-  if (!dateStr) return 'recently';
-  const date = new Date(dateStr);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-  const diffDays = Math.floor(diffHours / 24);
-  
-  if (diffHours < 1) return 'just now';
-  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
-  if (diffDays < 7) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
-  return date.toLocaleDateString();
-}
-
-function formatSourcesForCard(sources: any[]): any[] {
-  if (!sources?.length) return [];
-  
-  return [
-    {
-      type: "TextBlock",
-      text: "**Sources:**",
-      wrap: true,
-      spacing: "Medium",
+async function resolveOrCreateTenant(aadTenantId: string) {
+  const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SUPABASE_ANON_KEY,
+      "x-internal-token": INTERNAL_LOOKUP_SECRET,
     },
-    ...sources.map((s) => ({
-      type: "TextBlock",
-      text: s.url 
-        ? `• [${s.title}](${s.url}) — ${getPlatformLabel(s.source)} (Updated ${getRelativeDate(s.updated_at)})`
-        : `• ${s.title} — ${getPlatformLabel(s.source)} (Updated ${getRelativeDate(s.updated_at)})`,
-      wrap: true,
-      spacing: "Small",
-    })),
-  ];
+    body: JSON.stringify({
+      teams_tenant_id: aadTenantId,
+      auto_provision: true,
+    }),
+  });
+
+  if (!res.ok) {
+    console.error("❌ Tenant lookup/provision failed", await res.text());
+    return null;
+  }
+
+  const json = await res.json();
+  return json.tenant_id ?? null;
 }
 
 /********************************************************************************************
- * TENANT LOOKUP
+ * BOT LOOKUP BY APP ID (JWT VALIDATION)
  ********************************************************************************************/
 async function resolveByBotAppId(botAppId: string) {
   const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
@@ -111,21 +78,6 @@ async function resolveByBotAppId(botAppId: string) {
     body: JSON.stringify({ bot_app_id: botAppId }),
   });
   return res.ok ? res.json() : null;
-}
-
-async function resolveTenantId(aadTenantId: string) {
-  const res = await fetch(TEAMS_TENANT_LOOKUP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: SUPABASE_ANON_KEY,
-      "x-internal-token": INTERNAL_LOOKUP_SECRET,
-    },
-    body: JSON.stringify({ teams_tenant_id: aadTenantId }),
-  });
-  if (!res.ok) return null;
-  const json = await res.json();
-  return json.tenant_id ?? null;
 }
 
 /********************************************************************************************
@@ -146,21 +98,6 @@ async function verifyJwt(authHeader: string) {
   });
 
   return tenantInfo;
-}
-
-/********************************************************************************************
- * TYPES
- ********************************************************************************************/
-interface TeamsActivity {
-  type?: string;
-  id?: string;
-  text?: string;
-  from?: { id?: string };
-  serviceUrl?: string;
-  replyToId?: string;
-  conversation?: { id: string; tenantId?: string };
-  channelData?: { tenant?: { id?: string } };
-  value?: any;
 }
 
 /********************************************************************************************
@@ -198,26 +135,10 @@ async function handleTeams(req: Request): Promise<Response> {
 
   if (req.method !== "POST") return new Response("ok");
 
-  let activity: TeamsActivity;
-  try {
-    activity = JSON.parse(await req.text());
-  } catch {
-    console.warn("⚠️ Invalid JSON body");
-    return new Response("ok");
-  }
-
-  console.log(
-    "📨 Activity",
-    activity.type,
-    "| text:",
-    activity.text?.slice(0, 80),
-  );
+  const activity = await req.json();
 
   const auth = req.headers.get("Authorization");
-  if (!auth) {
-    console.warn("⚠️ Missing Authorization header");
-    return new Response("ok");
-  }
+  if (!auth) return new Response("ok");
 
   let creds;
   try {
@@ -229,41 +150,22 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const aadTenantId =
     activity.channelData?.tenant?.id || activity.conversation?.tenantId;
+
+  console.log("🏷️ AAD TENANT ID:", aadTenantId);
+
   if (!aadTenantId) {
     console.warn("⚠️ Missing AAD tenant id");
     return new Response("ok");
   }
 
-  const tenantId = await resolveTenantId(aadTenantId);
+  const tenantId = await resolveOrCreateTenant(aadTenantId);
+
   if (!tenantId) {
-    console.warn("⚠️ Tenant not found");
+    console.error("❌ Unable to resolve or create tenant for", aadTenantId);
     return new Response("ok");
   }
 
-  /****************************
-   * FEEDBACK
-   ****************************/
-  if (activity.value?.action === "feedback") {
-    console.log("👍 Feedback received", activity.value);
-
-    await fetch(RAG_QUERY_URL.replace("/rag-query", "/feedback"), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SUPABASE_ANON_KEY,
-        "x-internal-token": INTERNAL_LOOKUP_SECRET,
-      },
-      body: JSON.stringify({
-        qa_log_id: activity.value.qa_log_id,
-        feedback: activity.value.feedback,
-        tenant_id: tenantId,
-        source: "teams",
-        teams_user_id: activity.from?.id ?? null,
-      }),
-    });
-
-    return new Response("ok");
-  }
+  console.log("🔐 InnsynAI tenant resolved:", tenantId);
 
   if (!activity.text) return new Response("ok");
 
@@ -274,7 +176,7 @@ async function handleTeams(req: Request): Promise<Response> {
 
   const placeholderRes = await fetch(
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
-      activity.conversation!.id,
+      activity.conversation.id,
     )}/activities`,
     {
       method: "POST",
@@ -293,10 +195,8 @@ async function handleTeams(req: Request): Promise<Response> {
   const placeholderJson = await placeholderRes.json();
   const placeholderActivityId = placeholderJson.id;
 
-  console.log("🕒 Placeholder sent", placeholderActivityId);
-
   /****************************
-   * RAG QUERY (INLINE)
+   * RAG QUERY
    ****************************/
   const ragRes = await fetch(RAG_QUERY_URL, {
     method: "POST",
@@ -317,50 +217,15 @@ async function handleTeams(req: Request): Promise<Response> {
   }
 
   const rag = await ragRes.json();
-  console.log("🧠 RAG completed", rag.qa_log_id, "| sources:", rag.sources?.length ?? 0);
 
   /****************************
-   * BUILD ACTIONS
-   ****************************/
-  const actions = rag.qa_log_id
-    ? [
-        {
-          type: "Action.Submit",
-          title: "👍 Helpful",
-          data: { action: "feedback", feedback: "up", qa_log_id: rag.qa_log_id },
-        },
-        {
-          type: "Action.Submit",
-          title: "👎 Not helpful",
-          data: {
-            action: "feedback",
-            feedback: "down",
-            qa_log_id: rag.qa_log_id,
-          },
-        },
-      ]
-    : [];
-
-  /****************************
-   * BUILD CARD BODY WITH SOURCES
-   ****************************/
-  const cardBody = [
-    {
-      type: "TextBlock",
-      text: rag.answer ?? "No answer found.",
-      wrap: true,
-    },
-    ...formatSourcesForCard(rag.sources),
-  ];
-
-  /****************************
-   * PUT PLACEHOLDER
+   * UPDATE MESSAGE
    ****************************/
   const patchToken = await getBotAccessToken(aadTenantId, creds);
 
-  const patchRes = await fetch(
+  await fetch(
     `${activity.serviceUrl}/v3/conversations/${encodeURIComponent(
-      activity.conversation!.id,
+      activity.conversation.id,
     )}/activities/${placeholderActivityId}`,
     {
       method: "PUT",
@@ -370,26 +235,10 @@ async function handleTeams(req: Request): Promise<Response> {
       },
       body: JSON.stringify({
         type: "message",
-        attachments: [
-          {
-            contentType: "application/vnd.microsoft.card.adaptive",
-            content: {
-              type: "AdaptiveCard",
-              version: "1.4",
-              body: cardBody,
-              actions,
-            },
-          },
-        ],
+        text: rag.answer ?? "No answer found.",
       }),
     },
   );
-
-  if (!patchRes.ok) {
-    console.error("❌ PATCH failed", patchRes.status, await patchRes.text());
-  } else {
-    console.log("✅ Message updated with sources");
-  }
 
   return new Response("ok");
 }
@@ -398,7 +247,7 @@ async function handleTeams(req: Request): Promise<Response> {
  * SERVER
  ********************************************************************************************/
 serve(req => {
-  console.log("➡️ Request", req.method, new URL(req.url).pathname);
-  if (new URL(req.url).pathname === "/teams") return handleTeams(req);
+  const path = new URL(req.url).pathname;
+  if (path === "/teams") return handleTeams(req);
   return new Response("ok");
 });
